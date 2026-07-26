@@ -4,7 +4,7 @@ import java.io.Serializable;
 import java.time.Instant;
 
 public sealed interface DomainEvent extends Serializable
-        permits ChargeCreatedEvent, SiblingVaRegisteredEvent, PaymentReceivedEvent, DoubleSettlementDetectedEvent {
+        permits ChargeCreatedEvent, ChargeCancelledEvent, SiblingVaRegisteredEvent, PaymentReceivedEvent, DoubleSettlementDetectedEvent {
 
     String eventId();
     String chargeId();

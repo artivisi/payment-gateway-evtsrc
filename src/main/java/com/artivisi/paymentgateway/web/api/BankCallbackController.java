@@ -2,6 +2,7 @@ package com.artivisi.paymentgateway.web.api;
 
 import com.artivisi.paymentgateway.domain.event.PaymentReceivedEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -13,12 +14,11 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.UUID;
 
 @RestController
-@RequestMapping("/api/v1/payments")
+@RequestMapping({"/api/payments", "/api/v1/payments"})
 public class BankCallbackController {
 
     private static final Logger log = LoggerFactory.getLogger(BankCallbackController.class);
@@ -34,23 +34,8 @@ public class BankCallbackController {
         this.objectMapper = objectMapper;
     }
 
-    public record PaymentCallbackRequest(
-            String chargeId,
-            String bankCode,
-            String vaNumber,
-            String bankReference,
-            BigDecimal amount,
-            Instant paymentTimestamp
-    ) {}
-
-    public record PaymentCallbackResponse(
-            String status,
-            String message,
-            String eventId
-    ) {}
-
     @PostMapping
-    public ResponseEntity<PaymentCallbackResponse> handleBankCallback(@RequestBody PaymentCallbackRequest request) {
+    public ResponseEntity<PaymentCallbackResponse> handleBankCallback(@Valid @RequestBody PaymentCallbackRequest request) {
         String eventId = UUID.randomUUID().toString();
         Instant now = Instant.now();
 
