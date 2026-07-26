@@ -438,6 +438,24 @@ A key architectural design question when building payment gateways is whether to
 | **Correlation Strategy** | Standard event logging (`correlationId` header). | **Deferred `CompletableFuture` + Broadcast Consumer Groups**. |
 | **Operational Complexity** | **Low** (Single deployment artifact, zero fanout network traffic). | **High** (Per-instance consumer groups, network traffic amplification). |
 
+### 3.6 Initial Deployment Seeding for Pre-Existing Virtual Accounts & Charges
+
+When deploying `payment-gateway-evtsrc` into an existing enterprise environment with pre-existing charges and bank VAs, initial state can be loaded directly from a **PostgreSQL database dump** or **CSV export** without custom database bypasses on the hot path:
+
+#### Option A: PostgreSQL Database Dump Seeding (`PostgresInitialStateSeeder`) — Recommended for DBAs
+1. **Database Dump Import**: DBAs restore legacy tables directly into PostgreSQL tables (`charge_projection`, `sibling_va_projection`).
+2. **On-Startup Event Emission**: When `app.migration.seed-from-postgres=true` is set, `PostgresInitialStateSeeder` runs on application startup:
+   - Reads active pre-existing charges and Virtual Accounts from PostgreSQL.
+   - Emits synthetic `ChargeCreatedEvent` records to `charge-events` and `SiblingVaRegisteredEvent` records to `va-events` with historical timestamps.
+3. **Automated Kafka Streams & RocksDB Hydration**:
+   - `PaymentGatewayStreamsTopology` consumes these initial events and populates local off-heap RocksDB state stores (`charge-state-store`, `va-registry-store`).
+4. **Cold-Start & Failover Resilience**:
+   - Kafka Streams automatically writes backup records to Kafka broker changelog topics (`...-changelog`). Any future container restarts or node scale-outs re-hydrate RocksDB directly from Kafka changelogs without querying PostgreSQL again.
+
+#### Option B: External CSV / Payload Seeding (`InitialStateSeeder`)
+1. **Migration Script / CLI Tool**: An external migration worker or script reads CSV legacy data files.
+2. **Direct Kafka Event Emission**: `InitialStateSeeder.seedInitialState(...)` emits synthetic events directly into Kafka topics (`charge-events`, `va-events`).
+
 ---
 
 ## 4. Production Sizing, High Availability & Operational Scalability

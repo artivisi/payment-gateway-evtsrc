@@ -42,3 +42,5 @@ app:
     payment-events: payment-events
     reconciliation-events: reconciliation-events
     webhook-events: webhook-events
+  migration:
+    seed-from-postgres: ${APP_MIGRATION_SEED_FROM_POSTGRES:false}
