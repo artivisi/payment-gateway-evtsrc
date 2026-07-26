@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Payment Gateway CQRS Dashboard</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
+        h1, h2 { color: #38bdf8; }
+        .card { background-color: #1e293b; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #334155; }
+        th { background-color: #334155; color: #cbd5e1; }
+        tr:hover { background-color: #1e293b; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
+        .badge-active { background-color: #0284c7; color: white; }
+        .badge-paid { background-color: #16a34a; color: white; }
+        .badge-double { background-color: #dc2626; color: white; }
+    </style>
+</head>
+<body>
+    <h1>Payment Gateway CQRS Operator Dashboard</h1>
+    <p>Read Models fetched from <strong>PostgreSQL 18</strong> via <strong>Spring Data JPA Repositories</strong>.</p>
+
+    <div class="card">
+        <h2>Active & Recent Charges</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Charge ID</th>
+                    <th>Client ID</th>
+                    <th>Type</th>
+                    <th>Total Amount</th>
+                    <th>Paid Amount</th>
+                    <th>Remaining</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr th:each="charge : ${charges}">
+                    <td th:text="${charge.id}">CHG-101</td>
+                    <td th:text="${charge.clientId}">CLIENT-UNI</td>
+                    <td th:text="${charge.chargeType}">CLOSED</td>
+                    <td th:text="${'Rp ' + #numbers.formatDecimal(charge.totalAmount, 0, 'COMMA', 2, 'POINT')}">Rp 1,000,000.00</td>
+                    <td th:text="${'Rp ' + #numbers.formatDecimal(charge.paidAmount, 0, 'COMMA', 2, 'POINT')}">Rp 0.00</td>
+                    <td th:text="${'Rp ' + #numbers.formatDecimal(charge.remainingAmount, 0, 'COMMA', 2, 'POINT')}">Rp 1,000,000.00</td>
+                    <td>
+                        <span th:class="${charge.status == 'FULLY_PAID' ? 'badge badge-paid' : 'badge badge-active'}"
+                              th:text="${charge.status}">ACTIVE</span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>Payment Transaction History</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Payment Event ID</th>
+                    <th>Charge ID</th>
+                    <th>Bank Code</th>
+                    <th>VA Number</th>
+                    <th>Bank Reference</th>
+                    <th>Amount</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr th:each="payment : ${payments}">
+                    <td th:text="${payment.id}">PAY-101</td>
+                    <td th:text="${payment.chargeId}">CHG-101</td>
+                    <td th:text="${payment.bankCode}">MAYBANK</td>
+                    <td th:text="${payment.vaNumber}">8801928371</td>
+                    <td th:text="${payment.bankReference}">REF-8819283</td>
+                    <td th:text="${'Rp ' + #numbers.formatDecimal(payment.amount, 0, 'COMMA', 2, 'POINT')}">Rp 500,000.00</td>
+                    <td>
+                        <span th:if="${payment.doubleSettlement}" class="badge badge-double">DOUBLE SETTLEMENT</span>
+                        <span th:if="${!payment.doubleSettlement}" class="badge badge-paid">SUCCESS</span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
