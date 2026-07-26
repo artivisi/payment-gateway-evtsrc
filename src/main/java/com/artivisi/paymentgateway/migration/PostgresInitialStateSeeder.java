@@ -7,7 +7,7 @@ import com.artivisi.paymentgateway.projection.entity.SiblingVaProjectionEntity;
 import com.artivisi.paymentgateway.projection.repository.ChargeProjectionRepository;
 import com.artivisi.paymentgateway.projection.repository.SiblingVaProjectionRepository;
 import com.artivisi.paymentgateway.streams.StoreConstants;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StoreQueryParameters;
 import org.apache.kafka.streams.state.QueryableStoreTypes;

@@ -1,0 +1,97 @@
+[
+  {
+    "chargeId": "CHG-TAZKIA-2026-001",
+    "clientId": "CLIENT-UNIVERSITAS-TAZKIA",
+    "chargeType": "CLOSED",
+    "totalAmount": 2500000.00,
+    "description": "Tuition Fee Semester 1 - Student 2026001",
+    "siblingVas": [
+      { "bankCode": "MAYBANK", "vaNumber": "88012026001" },
+      { "bankCode": "BSI", "vaNumber": "99012026001" },
+      { "bankCode": "CIMB", "vaNumber": "77012026001" },
+      { "bankCode": "BCA", "vaNumber": "11012026001" },
+      { "bankCode": "BNI", "vaNumber": "22012026001" },
+      { "bankCode": "BRI", "vaNumber": "33012026001" }
+    ]
+  },
+  {
+    "chargeId": "CHG-TAZKIA-2026-002",
+    "clientId": "CLIENT-UNIVERSITAS-TAZKIA",
+    "chargeType": "CLOSED",
+    "totalAmount": 3200000.00,
+    "description": "Tuition Fee Semester 1 - Student 2026002",
+    "siblingVas": [
+      { "bankCode": "MAYBANK", "vaNumber": "88012026002" },
+      { "bankCode": "BSI", "vaNumber": "99012026002" },
+      { "bankCode": "BCA", "vaNumber": "11012026002" }
+    ]
+  },
+  {
+    "chargeId": "CHG-TAZKIA-2026-003",
+    "clientId": "CLIENT-UNIVERSITAS-TAZKIA",
+    "chargeType": "OPEN",
+    "totalAmount": 5000000.00,
+    "description": "Student Open Wallet Deposit",
+    "siblingVas": [
+      { "bankCode": "MAYBANK", "vaNumber": "88012026003" },
+      { "bankCode": "BSI", "vaNumber": "99012026003" }
+    ]
+  },
+  {
+    "chargeId": "CHG-TAZKIA-2026-004",
+    "clientId": "CLIENT-UNIVERSITAS-TAZKIA",
+    "chargeType": "INSTALLMENT",
+    "totalAmount": 6000000.00,
+    "description": "Dormitory Installment Fee",
+    "siblingVas": [
+      { "bankCode": "BSI", "vaNumber": "99012026004" },
+      { "bankCode": "CIMB", "vaNumber": "77012026004" }
+    ]
+  },
+  {
+    "chargeId": "CHG-RSI-2026-001",
+    "clientId": "CLIENT-RUMAH-SAKIT-ISLAM",
+    "chargeType": "CLOSED",
+    "totalAmount": 1750000.00,
+    "description": "Inpatient Hospitalization Bill - Patient P-101",
+    "siblingVas": [
+      { "bankCode": "MAYBANK", "vaNumber": "88022026001" },
+      { "bankCode": "BCA", "vaNumber": "11022026001" },
+      { "bankCode": "BNI", "vaNumber": "22022026001" }
+    ]
+  },
+  {
+    "chargeId": "CHG-RSI-2026-002",
+    "clientId": "CLIENT-RUMAH-SAKIT-ISLAM",
+    "chargeType": "CLOSED",
+    "totalAmount": 450000.00,
+    "description": "Outpatient Pharmacy Bill - Patient P-102",
+    "siblingVas": [
+      { "bankCode": "BRI", "vaNumber": "33022026002" },
+      { "bankCode": "BSI", "vaNumber": "99022026002" }
+    ]
+  },
+  {
+    "chargeId": "CHG-FOUNDATION-001",
+    "clientId": "CLIENT-FOUNDATION-PEDULI",
+    "chargeType": "OPEN",
+    "totalAmount": 10000000.00,
+    "description": "Donation Campaign Open VA",
+    "siblingVas": [
+      { "bankCode": "MAYBANK", "vaNumber": "88032026001" },
+      { "bankCode": "BSI", "vaNumber": "99032026001" },
+      { "bankCode": "CIMB", "vaNumber": "77032026001" }
+    ]
+  },
+  {
+    "chargeId": "CHG-FOUNDATION-002",
+    "clientId": "CLIENT-FOUNDATION-PEDULI",
+    "chargeType": "CLOSED",
+    "totalAmount": 1000000.00,
+    "description": "Sponsorship Pledge - Supporter S-001",
+    "siblingVas": [
+      { "bankCode": "BCA", "vaNumber": "11032026002" },
+      { "bankCode": "BNI", "vaNumber": "22032026002" }
+    ]
+  }
+]

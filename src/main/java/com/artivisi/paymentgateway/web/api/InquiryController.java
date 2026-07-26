@@ -1,20 +1,11 @@
 package com.artivisi.paymentgateway.web.api;
 
-import com.artivisi.paymentgateway.streams.StoreConstants;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.artivisi.paymentgateway.service.InquiryApplicationService;
+import com.fasterxml.jackson.annotation.JsonAlias;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
-import org.apache.kafka.streams.KafkaStreams;
-import org.apache.kafka.streams.StoreQueryParameters;
-import org.apache.kafka.streams.state.QueryableStoreTypes;
-import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.kafka.config.StreamsBuilderFactoryBean;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -23,29 +14,30 @@ import org.springframework.web.bind.annotation.RestController;
 import java.math.BigDecimal;
 
 /**
- * Bank Account Inquiry Controller.
- * Pure Kafka / RocksDB solution (<1ms off-heap lookup).
- * ZERO PostgreSQL dependency — PostgreSQL is used strictly for reporting sinks.
+ * Bank Account Inquiry HTTP Controller.
+ * Thin HTTP adapter: delegates all RocksDB resolution logic to InquiryApplicationService.
  */
 @RestController
-@RequestMapping({"/api/inquiry", "/api/v1/inquiry"})
+@RequestMapping({
+    "/api/inquiry",
+    "/api/v1/inquiry",
+    "/api/bank/maybank/v1.0/transfer-va/inquiry"
+})
 public class InquiryController {
 
-    private static final Logger log = LoggerFactory.getLogger(InquiryController.class);
+    private final InquiryApplicationService inquiryApplicationService;
 
-    private final ObjectMapper objectMapper;
-
-    @Autowired(required = false)
-    private StreamsBuilderFactoryBean streamsBuilderFactoryBean;
-
-    public InquiryController(ObjectMapper objectMapper) {
-        this.objectMapper = objectMapper;
+    public InquiryController(InquiryApplicationService inquiryApplicationService) {
+        this.inquiryApplicationService = inquiryApplicationService;
     }
 
     public record AccountInquiryRequest(
             @NotBlank(message = "bankCode is required")
+            @JsonAlias({"bank_code", "kodeBank", "partnerServiceId"})
             String bankCode,
+
             @NotBlank(message = "vaNumber is required")
+            @JsonAlias({"va_number", "nomorPembayaran", "virtualAccountNo"})
             String vaNumber
     ) {}
 
@@ -60,58 +52,24 @@ public class InquiryController {
 
     @PostMapping
     public ResponseEntity<AccountInquiryResponse> inquireAccount(@Valid @RequestBody AccountInquiryRequest request) {
-        if (streamsBuilderFactoryBean == null) {
-            log.warn("Kafka Streams builder not initialized; inquiry returning 503");
-            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                    .body(new AccountInquiryResponse("ERROR", request.bankCode(), request.vaNumber(), null, null, "Streaming engine unavailable"));
-        }
+        InquiryApplicationService.InquiryResult result = inquiryApplicationService.inquireAccount(request);
 
-        try {
-            KafkaStreams kafkaStreams = streamsBuilderFactoryBean.getKafkaStreams();
-            if (kafkaStreams == null || kafkaStreams.state() != KafkaStreams.State.RUNNING) {
-                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                        .body(new AccountInquiryResponse("ERROR", request.bankCode(), request.vaNumber(), null, null, "Streams state store re-balancing"));
-            }
+        HttpStatus status = switch (result.status()) {
+            case "SUCCESS" -> HttpStatus.OK;
+            case "INVALID_VA", "INVALID_CHARGE" -> HttpStatus.NOT_FOUND;
+            case "ERROR" -> result.message() != null && result.message().contains("unavailable") 
+                    ? HttpStatus.SERVICE_UNAVAILABLE 
+                    : HttpStatus.INTERNAL_SERVER_ERROR;
+            default -> HttpStatus.INTERNAL_SERVER_ERROR;
+        };
 
-            // 1. Query va-registry-store in local off-heap RocksDB (<1ms)
-            ReadOnlyKeyValueStore<String, String> vaStore = kafkaStreams.store(
-                    StoreQueryParameters.fromNameAndType(StoreConstants.VA_REGISTRY_STORE, QueryableStoreTypes.keyValueStore())
-            );
-            String lookupKey = request.bankCode() + "_" + request.vaNumber();
-            String chargeId = vaStore.get(lookupKey);
-            if (chargeId == null) {
-                // Fallback to vaNumber alone
-                chargeId = vaStore.get(request.vaNumber());
-            }
-
-            if (chargeId == null) {
-                return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                        .body(new AccountInquiryResponse("INVALID_VA", request.bankCode(), request.vaNumber(), null, null, "Virtual account not found"));
-            }
-
-            // 2. Query charge-state-store in local off-heap RocksDB (<1ms)
-            ReadOnlyKeyValueStore<String, String> chargeStore = kafkaStreams.store(
-                    StoreQueryParameters.fromNameAndType(StoreConstants.CHARGE_STATE_STORE, QueryableStoreTypes.keyValueStore())
-            );
-            String chargeJson = chargeStore.get(chargeId);
-            if (chargeJson == null) {
-                return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                        .body(new AccountInquiryResponse("INVALID_CHARGE", request.bankCode(), request.vaNumber(), null, null, "Charge record not found for VA"));
-            }
-
-            JsonNode node = objectMapper.readTree(chargeJson);
-            String customerName = node.has("description") ? node.get("description").asText("Customer") : "Customer";
-            BigDecimal totalAmount = node.has("totalAmount") ? new BigDecimal(node.get("totalAmount").asText("0")) : BigDecimal.ZERO;
-
-            log.info("Account inquiry resolved in RocksDB for bankCode: {}, vaNumber: {}, chargeId: {}",
-                    request.bankCode(), request.vaNumber(), chargeId);
-
-            return ResponseEntity.ok(new AccountInquiryResponse("SUCCESS", request.bankCode(), request.vaNumber(), customerName, totalAmount, "Account inquiry successful"));
-
-        } catch (Exception e) {
-            log.error("Account inquiry failed in RocksDB for vaNumber: {}", request.vaNumber(), e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(new AccountInquiryResponse("ERROR", request.bankCode(), request.vaNumber(), null, null, "Inquiry processing error: " + e.getMessage()));
-        }
+        return ResponseEntity.status(status).body(new AccountInquiryResponse(
+                result.status(),
+                result.bankCode(),
+                result.vaNumber(),
+                result.customerName(),
+                result.amount(),
+                result.message()
+        ));
     }
 }

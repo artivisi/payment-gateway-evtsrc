@@ -2,7 +2,7 @@ package com.artivisi.paymentgateway.migration;
 
 import com.artivisi.paymentgateway.domain.event.ChargeCreatedEvent;
 import com.artivisi.paymentgateway.domain.event.SiblingVaRegisteredEvent;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;

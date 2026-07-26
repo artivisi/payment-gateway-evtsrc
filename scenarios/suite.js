@@ -5,7 +5,31 @@ import { check, sleep } from 'k6';
 // Command: k6 run -e TARGET_URL=http://localhost:8080 -e SCENARIO=callback_peak scenarios/suite.js
 
 const TARGET_URL = __ENV.TARGET_URL || 'http://localhost:8080';
-const SCENARIO = __ENV.SCENARIO || 'callback_peak';
+
+// Pre-seeded Virtual Accounts across multiple banks (MAYBANK, BSI, CIMB, BCA, BNI, BRI)
+const SEEDED_VAS = [
+    { chargeId: 'CHG-TAZKIA-2026-001', bankCode: 'MAYBANK', vaNumber: '88012026001', amount: 2500000.00 },
+    { chargeId: 'CHG-TAZKIA-2026-001', bankCode: 'BSI', vaNumber: '99012026001', amount: 2500000.00 },
+    { chargeId: 'CHG-TAZKIA-2026-001', bankCode: 'CIMB', vaNumber: '77012026001', amount: 2500000.00 },
+    { chargeId: 'CHG-TAZKIA-2026-001', bankCode: 'BCA', vaNumber: '11012026001', amount: 2500000.00 },
+    { chargeId: 'CHG-TAZKIA-2026-001', bankCode: 'BNI', vaNumber: '22012026001', amount: 2500000.00 },
+    { chargeId: 'CHG-TAZKIA-2026-001', bankCode: 'BRI', vaNumber: '33012026001', amount: 2500000.00 },
+    
+    { chargeId: 'CHG-TAZKIA-2026-002', bankCode: 'MAYBANK', vaNumber: '88012026002', amount: 3200000.00 },
+    { chargeId: 'CHG-TAZKIA-2026-002', bankCode: 'BSI', vaNumber: '99012026002', amount: 3200000.00 },
+    { chargeId: 'CHG-TAZKIA-2026-002', bankCode: 'BCA', vaNumber: '11012026002', amount: 3200000.00 },
+    
+    { chargeId: 'CHG-TAZKIA-2026-003', bankCode: 'MAYBANK', vaNumber: '88012026003', amount: 50000.00 },
+    { chargeId: 'CHG-TAZKIA-2026-003', bankCode: 'BSI', vaNumber: '99012026003', amount: 100000.00 },
+    
+    { chargeId: 'CHG-RSI-2026-001', bankCode: 'MAYBANK', vaNumber: '88022026001', amount: 1750000.00 },
+    { chargeId: 'CHG-RSI-2026-001', bankCode: 'BCA', vaNumber: '11022026001', amount: 1750000.00 },
+    { chargeId: 'CHG-RSI-2026-001', bankCode: 'BNI', vaNumber: '22022026001', amount: 1750000.00 },
+    
+    { chargeId: 'CHG-FOUNDATION-001', bankCode: 'MAYBANK', vaNumber: '88032026001', amount: 25000.00 },
+    { chargeId: 'CHG-FOUNDATION-001', bankCode: 'BSI', vaNumber: '99032026001', amount: 50000.00 },
+    { chargeId: 'CHG-FOUNDATION-001', bankCode: 'CIMB', vaNumber: '77032026001', amount: 100000.00 }
+];
 
 export const options = {
     scenarios: {
@@ -30,15 +54,15 @@ export const options = {
 };
 
 export default function () {
-    const chargeId = `CHG-${Math.floor(Math.random() * 100000)}`;
-    const bankRef = `REF-${Math.floor(Math.random() * 10000000)}`;
+    const item = SEEDED_VAS[Math.floor(Math.random() * SEEDED_VAS.length)];
+    const bankRef = `REF-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
     
     const payload = JSON.stringify({
-        chargeId: chargeId,
-        bankCode: 'MAYBANK',
-        vaNumber: '8801928371',
+        chargeId: item.chargeId,
+        bankCode: item.bankCode,
+        vaNumber: item.vaNumber,
         bankReference: bankRef,
-        amount: 500000.00,
+        amount: item.amount,
         paymentTimestamp: new Date().toISOString()
     });
 

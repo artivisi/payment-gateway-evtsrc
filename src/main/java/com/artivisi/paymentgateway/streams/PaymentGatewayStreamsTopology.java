@@ -3,9 +3,9 @@ package com.artivisi.paymentgateway.streams;
 import com.artivisi.paymentgateway.domain.event.ChargeCreatedEvent;
 import com.artivisi.paymentgateway.domain.event.PaymentReceivedEvent;
 import com.artivisi.paymentgateway.domain.event.SiblingVaRegisteredEvent;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.Consumed;
@@ -175,8 +175,8 @@ public class PaymentGatewayStreamsTopology {
                             String existingChargeJson = chargeStore.get(payment.chargeId());
                             if (existingChargeJson != null) {
                                 ObjectNode chargeNode = (ObjectNode) objectMapper.readTree(existingChargeJson);
-                                BigDecimal currentAmount = chargeNode.has("totalAmount")
-                                        ? new BigDecimal(chargeNode.get("totalAmount").asText("0"))
+                                BigDecimal currentAmount = chargeNode.hasNonNull("totalAmount")
+                                        ? new BigDecimal(chargeNode.get("totalAmount").asString())
                                         : BigDecimal.ZERO;
                                 BigDecimal newAmount = currentAmount.subtract(payment.amount()).max(BigDecimal.ZERO);
                                 chargeNode.put("totalAmount", newAmount.toPlainString());
