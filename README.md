@@ -294,13 +294,6 @@ Traditional monolithic architecture where all core modules, callback controllers
 
 ```mermaid
 flowchart TD
-    subgraph Clients & Banks
-        CLIENT[Client Application / Subledger<br/>e.g. account-receivable]
-        B1[Maybank<br/>SNAP / REST]
-        B2[BSI<br/>REST / JSON]
-        B3[CIMB<br/>SOAP / XML]
-    end
-
     subgraph Relational Gateway Service ["payment-gateway (Monolithic RDBMS App)"]
         API[Unified REST API<br/>Create Charge & Sibling VAs]
         CALLBACK[Bank Callback Controller<br/>Inquiry & Payment Hooks]
@@ -329,6 +322,121 @@ flowchart TD
 
     NOTIF -->|Deliver Webhook| CLIENT
 ```
+
+---
+
+### 3.5 Synchronous HTTP Protocol Adapters & Zero-Pending State Semantics
+
+Indonesian banking protocols (such as Maybank SNAP, BSI, and CIMB standards) mandate **strict synchronous HTTP responses**. The gateway must never return an intermediate "pending" or "in-progress" state to the bank:
+
+1. **Account Inquiry (`POST /api/v1/inquiry`)**: Must respond synchronously with **`HTTP 200 OK` + Customer Name & Balance** or **`HTTP 404` + Error Code (`INVALID_VA`)**.
+2. **Payment Callback (`POST /api/v1/payments`)**: Must respond synchronously with **`HTTP 200 OK` (Payment Success)** or **`HTTP 400 / 422` (Payment Failed + Error Reason)**.
+
+`payment-gateway-evtsrc` meets these synchronous bank SLAs by executing **sub-millisecond pre-validation against local embedded RocksDB state stores ($<1\text{ms}$)** before appending to Kafka:
+
+```mermaid
+flowchart TD
+    subgraph Bank_Call ["Bank Protocols (Maybank SNAP / BSI / CIMB)"]
+        INQ_REQ["1. Account Inquiry Request<br/>(POST /api/v1/inquiry)"]
+        PAY_REQ["2. Payment Callback Request<br/>(POST /api/v1/payments)"]
+    end
+
+    subgraph App_Instance ["Application Server (JVM Process)"]
+        CTRL[Protocol Ingress Controller]
+        subgraph Local_RocksDB ["Off-Heap Local RocksDB (<1ms Lookups)"]
+            VA_STORE[("va-registry-store")]
+            CHG_STORE[("charge-state-store")]
+            IDEM_STORE[("idempotency-store")]
+        end
+        PROD[Kafka Producer]
+    end
+
+    subgraph Async_Engine ["Asynchronous Event Core & Sinks"]
+        KAFKA[(Kafka Topic: payment-events)]
+        WEBHOOK[Webhook Dispatcher]
+        PG[(PostgreSQL 18 Read DB)]
+    end
+
+    %% INQUIRY FLOW
+    INQ_REQ -->|"a. Sync HTTP POST"| CTRL
+    CTRL -->|"b. Lookup VA & Debt (<1ms)"| Local_RocksDB
+    CTRL -->|"c. Sync HTTP 200 OK (Customer Name + Total Amount)"| INQ_REQ
+
+    %% PAYMENT FLOW
+    PAY_REQ -->|"a. Sync HTTP POST"| CTRL
+    CTRL -->|"b. Pre-Validate Invariants & Idempotency (<1ms)"| Local_RocksDB
+    
+    CTRL -->|"c1. Validation Failed -> HTTP 400 Bad Request"| PAY_REQ
+    CTRL -->|"c2. Validation Passed -> Append Event (<1ms)"| PROD
+    PROD --> KAFKA
+    CTRL -->|"c3. Sync HTTP 200 OK (Payment Success)"| PAY_REQ
+
+    %% ASYNC FANOUT
+    KAFKA -.-> WEBHOOK
+    KAFKA -.-> PG
+```
+
+#### Detailed Execution Mechanics & State Isolation:
+
+1. **Synchronous Account Inquiry Flow**:
+   - The bank sends `POST /api/v1/inquiry` with `bank_code` and `va_number`.
+   - The controller queries `va-registry-store` and `charge-state-store` directly in local RAM/SSD ($<1\text{ms}$).
+   - Returns **`HTTP 200 OK` containing customer name and remaining balance** without appending to Kafka or calling external databases.
+
+2. **Synchronous Payment Callback Validation & Execution**:
+   - The bank sends `POST /api/v1/payments` (`bank_code`, `va_number`, `bank_reference`, `amount`).
+   - **Hot-Path Pre-Validation ($<1\text{ms}$)**:
+     - **Idempotency Check**: Look up `bank_reference` in `idempotency-store`. If duplicate, return **`HTTP 200 OK` (Duplicate ACK)**.
+     - **VA & Invariant Check**: Look up `va_number` in `va-registry-store` and `charge-state-store`. If charge is already fully paid or amount is invalid, return **`HTTP 400 Bad Request` (`CHARGE_ALREADY_CLOSED` / `INVALID_AMOUNT`)**.
+   - **Kafka Append & Immediate Success ACK**:
+     - If validation passes, the controller appends `PaymentReceivedEvent` to Kafka topic `payment-events` ($\sim <1\text{ms}$).
+     - The controller returns **`HTTP 200 OK` (Payment Success)** synchronously to the bank.
+
+3. **Asynchronous Merchant Notification & Read Projections**:
+   - After the bank receives its synchronous `200 OK`, `WebhookDispatcherWorker` streams events from Kafka to deliver signed HTTP POST webhooks to client systems (subledgers like `account-receivable`).
+   - `PostgresProjectionSink` asynchronously upserts read models into PostgreSQL 18 for Web UI dashboard reporting.
+
+#### 3.5.1 Internal Uniform Correlation ID vs. External Bank Correlation ID Mapping
+
+To maintain strict architectural consistency across heterogeneous bank protocols while preserving full auditability, `payment-gateway-evtsrc` separates correlation identifiers into two distinct tiers:
+
+1. **Internal Uniform Correlation ID (`correlationId` / `eventId`)**:
+   - **Format**: Standardized internal `UUID` (e.g. `UUID.randomUUID()`) generated by the gateway.
+   - **Purpose**: Guarantees a consistent, time-ordered primary key across all internal application logs, Kafka event keys, RocksDB state stores, and PostgreSQL CQRS projection tables, regardless of which bank sent the callback.
+2. **External Bank Correlation ID (`externalCorrelationId` / `bankReference`)**:
+   - **Format**: Raw string provided by the bank or protocol adapter (e.g. SNAP `X-EXTERNAL-ID`, REST `X-Correlation-ID`, or `bankReference`). Formats vary widely across banks (alphanumeric, variable length, or missing).
+   - **Purpose**: Maps internal events back to the bank's external reference for audit inquiries, EOD CSV settlement matching, and outbound client webhook headers (`X-Correlation-ID`).
+
+#### Propagation Lifecycle:
+- **Ingress Extraction**: Controller receives callback, generates internal `eventId` (UUID), and extracts `externalCorrelationId` from request headers/payload.
+- **Kafka Event Enrichment**: `PaymentReceivedEvent` contains both `eventId` (internal UUID) and `externalCorrelationId` (bank reference).
+- **RocksDB Idempotency**: `idempotency-store` indexes transactions by `externalCorrelationId` / `bankReference` to block duplicate bank callbacks within $<1\text{ms}$.
+- **PostgreSQL CQRS Projection**: Read models store both `event_id` (UUID primary key) and `external_correlation_id`, allowing operators to search dashboard logs by either internal UUID or bank reference.
+- **Outbound Webhook Delivery**: `WebhookDispatcherWorker` attaches `X-Correlation-ID: <externalCorrelationId>` when delivering HTTP POST notifications to merchant subledgers (e.g. `account-receivable`).
+
+#### 3.5.2 Monolithic In-Process State vs. Distributed Microservices Correlation
+
+A key architectural design question when building payment gateways is whether to use **In-Process Synchronous Validation** or **Deferred Synchronous Correlation**:
+
+1. **Single-Module Monolithic Layout with Local RocksDB (`payment-gateway-evtsrc`)**:
+   - **Mechanism**: The ingress controller, state stores, and stream topologies live in the same Spring Boot application process.
+   - **Validation**: When a bank callback (`POST /api/v1/payments`) arrives, the HTTP request thread queries `idempotency-store`, `va-registry-store`, and `charge-state-store` directly in local RocksDB RAM/SSD ($<1\text{ms}$).
+   - **Result**: The controller accepts or rejects the callback **in-process before returning**. It appends the event to Kafka and returns `HTTP 200 OK` directly on the request thread. **No `CompletableFuture` or broadcast consumer groups are required.**
+
+2. **Distributed Microservices Layout (e.g. Ingress Gateway + Independent Bank Host Adapters / Clearing Core Microservices)**:
+   - **Mechanism**: The Ingress Gateway is decoupled into a thin edge microservice that does *not* host state, while downstream business logic (e.g. fraud screening, core settlement engine, or dedicated per-bank host adapter microservices) runs in separate application containers.
+   - **Validation**: When a request arrives, the Ingress Gateway microservice cannot validate state locally. It must publish a command event to Kafka (e.g. `bank-request-topic`) and **defer the HTTP response**.
+   - **Result**: The HTTP request thread registers a `CompletableFuture<Response>` keyed by correlation ID (`correlationId` / `bankReference`) and blocks on `future.get(timeout)`. Each Ingress Gateway replica runs a broadcast consumer group (`ingress-gateway-${instance-id}`) listening on `bank-response-topic` to correlate the outcome back to the waiting HTTP thread.
+
+#### Architectural Trade-off Comparison:
+
+| Metric / Aspect | Single-Module Monolith (`payment-gateway-evtsrc`) | Distributed Microservices Layout |
+|---|---|---|
+| **State Location** | Embedded off-heap **RocksDB** on local App node. | External microservices / database stores across network. |
+| **Validation Point** | **In-Process** (HTTP thread queries RocksDB directly). | **Out-of-Process** (Ingress waits for downstream Kafka event). |
+| **Sync Response Latency** | **$<1\text{ ms}$** | **$50\text{--}500\text{ ms}$** |
+| **Correlation Strategy** | Standard event logging (`correlationId` header). | **Deferred `CompletableFuture` + Broadcast Consumer Groups**. |
+| **Operational Complexity** | **Low** (Single deployment artifact, zero fanout network traffic). | **High** (Per-instance consumer groups, network traffic amplification). |
 
 ---
 
