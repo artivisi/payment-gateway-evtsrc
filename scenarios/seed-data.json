@@ -1,6 +1,6 @@
 [
   {
-    "chargeId": "CHG-TAZKIA-2026-001",
+    "chargeId": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
     "clientId": "CLIENT-UNIVERSITAS-TAZKIA",
     "chargeType": "CLOSED",
     "totalAmount": 2500000.00,
@@ -15,7 +15,7 @@
     ]
   },
   {
-    "chargeId": "CHG-TAZKIA-2026-002",
+    "chargeId": "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e",
     "clientId": "CLIENT-UNIVERSITAS-TAZKIA",
     "chargeType": "CLOSED",
     "totalAmount": 3200000.00,
@@ -27,7 +27,7 @@
     ]
   },
   {
-    "chargeId": "CHG-TAZKIA-2026-003",
+    "chargeId": "c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f",
     "clientId": "CLIENT-UNIVERSITAS-TAZKIA",
     "chargeType": "OPEN",
     "totalAmount": 5000000.00,
@@ -38,7 +38,7 @@
     ]
   },
   {
-    "chargeId": "CHG-TAZKIA-2026-004",
+    "chargeId": "d4e5f6a7-b8c9-4d0e-1f2a-3b4c5d6e7f8a",
     "clientId": "CLIENT-UNIVERSITAS-TAZKIA",
     "chargeType": "INSTALLMENT",
     "totalAmount": 6000000.00,
@@ -49,7 +49,7 @@
     ]
   },
   {
-    "chargeId": "CHG-RSI-2026-001",
+    "chargeId": "e5f6a7b8-c9d0-4e1f-2a3b-4c5d6e7f8a9b",
     "clientId": "CLIENT-RUMAH-SAKIT-ISLAM",
     "chargeType": "CLOSED",
     "totalAmount": 1750000.00,
@@ -61,7 +61,7 @@
     ]
   },
   {
-    "chargeId": "CHG-RSI-2026-002",
+    "chargeId": "f6a7b8c9-d0e1-4f2a-3b4c-5d6e7f8a9b0c",
     "clientId": "CLIENT-RUMAH-SAKIT-ISLAM",
     "chargeType": "CLOSED",
     "totalAmount": 450000.00,
@@ -72,7 +72,7 @@
     ]
   },
   {
-    "chargeId": "CHG-FOUNDATION-001",
+    "chargeId": "a7b8c9d0-e1f2-4a3b-4c5d-6e7f8a9b0c1d",
     "clientId": "CLIENT-FOUNDATION-PEDULI",
     "chargeType": "OPEN",
     "totalAmount": 10000000.00,
@@ -84,7 +84,7 @@
     ]
   },
   {
-    "chargeId": "CHG-FOUNDATION-002",
+    "chargeId": "b8c9d0e1-f2a3-4b4c-5d6e-7f8a9b0c1d2e",
     "clientId": "CLIENT-FOUNDATION-PEDULI",
     "chargeType": "CLOSED",
     "totalAmount": 1000000.00,

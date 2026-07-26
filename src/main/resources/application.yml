@@ -10,7 +10,7 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: validate
+      ddl-auto: update
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
@@ -31,7 +31,7 @@ spring:
       properties:
         default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
         default.value.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
-        state.dir: ${ROCKSDB_STATE_DIR:/var/data/rocksdb}
+        state.dir: ${ROCKSDB_STATE_DIR:./target/rocksdb}
         num.stream.threads: 6
         num.standby.replicas: 0 # Starter 1-node footprint setup
 
