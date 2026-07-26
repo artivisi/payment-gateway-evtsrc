@@ -7,14 +7,15 @@ import jakarta.persistence.Table;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.UUID;
 
 @Entity
 @Table(name = "charge_projection")
 public class ChargeProjectionEntity {
 
     @Id
-    @Column(name = "id", length = 64)
-    private String id;
+    @Column(name = "id", nullable = false)
+    private UUID id;
 
     @Column(name = "client_id", nullable = false, length = 64)
     private String clientId;
@@ -45,7 +46,7 @@ public class ChargeProjectionEntity {
 
     public ChargeProjectionEntity() {}
 
-    public ChargeProjectionEntity(String id, String clientId, String chargeType, BigDecimal totalAmount,
+    public ChargeProjectionEntity(UUID id, String clientId, String chargeType, BigDecimal totalAmount,
                                   BigDecimal paidAmount, BigDecimal remainingAmount, String status,
                                   String description, Instant createdAt, Instant updatedAt) {
         this.id = id;
@@ -60,8 +61,8 @@ public class ChargeProjectionEntity {
         this.updatedAt = updatedAt;
     }
 
-    public String getId() { return id; }
-    public void setId(String id) { this.id = id; }
+    public UUID getId() { return id; }
+    public void setId(UUID id) { this.id = id; }
 
     public String getClientId() { return clientId; }
     public void setClientId(String clientId) { this.clientId = clientId; }

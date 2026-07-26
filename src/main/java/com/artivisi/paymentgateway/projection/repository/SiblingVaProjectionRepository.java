@@ -6,11 +6,12 @@ import org.springframework.stereotype.Repository;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 @Repository
-public interface SiblingVaProjectionRepository extends JpaRepository<SiblingVaProjectionEntity, String> {
+public interface SiblingVaProjectionRepository extends JpaRepository<SiblingVaProjectionEntity, UUID> {
 
-    List<SiblingVaProjectionEntity> findByChargeId(String chargeId);
+    List<SiblingVaProjectionEntity> findByChargeId(UUID chargeId);
 
     Optional<SiblingVaProjectionEntity> findByBankCodeAndVaNumber(String bankCode, String vaNumber);
 }

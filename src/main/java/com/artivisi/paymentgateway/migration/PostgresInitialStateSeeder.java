@@ -118,26 +118,26 @@ public class PostgresInitialStateSeeder {
                 // 1. Emit ChargeCreatedEvent to Kafka topic
                 ChargeCreatedEvent chargeEvent = new ChargeCreatedEvent(
                         UUID.randomUUID().toString(),
-                        charge.getId(),
+                        charge.getId().toString(),
                         charge.getClientId(),
                         charge.getChargeType(),
                         charge.getRemainingAmount() != null ? charge.getRemainingAmount() : charge.getTotalAmount(),
                         charge.getDescription(),
                         charge.getCreatedAt() != null ? charge.getCreatedAt() : now
                 );
-                kafkaTemplate.send(chargeEventsTopic, charge.getId(), objectMapper.writeValueAsString(chargeEvent)).get();
+                kafkaTemplate.send(chargeEventsTopic, charge.getId().toString(), objectMapper.writeValueAsString(chargeEvent)).get();
 
                 // 2. Fetch and emit SiblingVaRegisteredEvents for this charge
                 List<SiblingVaProjectionEntity> vas = siblingVaProjectionRepository.findByChargeId(charge.getId());
                 for (SiblingVaProjectionEntity va : vas) {
                     SiblingVaRegisteredEvent vaEvent = new SiblingVaRegisteredEvent(
                             UUID.randomUUID().toString(),
-                            charge.getId(),
+                            charge.getId().toString(),
                             va.getBankCode(),
                             va.getVaNumber(),
                             va.getCreatedAt() != null ? va.getCreatedAt() : now
                     );
-                    kafkaTemplate.send(vaEventsTopic, charge.getId(), objectMapper.writeValueAsString(vaEvent)).get();
+                    kafkaTemplate.send(vaEventsTopic, charge.getId().toString(), objectMapper.writeValueAsString(vaEvent)).get();
                 }
 
                 seededChargeCount++;

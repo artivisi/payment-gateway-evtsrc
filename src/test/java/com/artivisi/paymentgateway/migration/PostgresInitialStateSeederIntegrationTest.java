@@ -11,6 +11,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -29,9 +30,12 @@ class PostgresInitialStateSeederIntegrationTest extends AbstractIntegrationTest 
     @DisplayName("REAL INTEGRATION: Seeding from real PostgreSQL database populates real repository successfully")
     void testSeedFromPostgres_Positive() {
         Instant now = Instant.now();
-        // Insert real pre-existing entity into database table
+        UUID chargeId = UUID.randomUUID();
+        UUID vaId = UUID.randomUUID();
+
+        // Insert real entity with UUID into database table
         ChargeProjectionEntity charge = new ChargeProjectionEntity(
-                "PG-MIGRATED-CHG-REAL",
+                chargeId,
                 "CLIENT-REAL-TAZKIA",
                 "CLOSED",
                 new BigDecimal("1500000.00"),
@@ -45,8 +49,8 @@ class PostgresInitialStateSeederIntegrationTest extends AbstractIntegrationTest 
         chargeProjectionRepository.save(charge);
 
         SiblingVaProjectionEntity va = new SiblingVaProjectionEntity(
-                "VA-ID-REAL",
-                "PG-MIGRATED-CHG-REAL",
+                vaId,
+                chargeId,
                 "MAYBANK",
                 "88011223344",
                 "ACTIVE",

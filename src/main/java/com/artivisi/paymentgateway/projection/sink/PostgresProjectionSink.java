@@ -19,7 +19,6 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
-import java.time.Instant;
 import java.util.UUID;
 
 @Component
@@ -74,11 +73,14 @@ public class PostgresProjectionSink {
     }
 
     private void projectChargeCreated(ChargeCreatedEvent event) {
-        if (chargeRepo.existsById(event.chargeId())) {
+        UUID chargeId = parseUUID(event.chargeId());
+        if (chargeId == null) return;
+
+        if (chargeRepo.existsById(chargeId)) {
             return; // Idempotent check
         }
         ChargeProjectionEntity entity = new ChargeProjectionEntity(
-                event.chargeId(),
+                chargeId,
                 event.clientId(),
                 event.chargeType(),
                 event.totalAmount(),
@@ -91,17 +93,19 @@ public class PostgresProjectionSink {
         );
 
         chargeRepo.save(entity);
-        log.info("Projected ChargeCreatedEvent to PostgreSQL for chargeId: {}", event.chargeId());
+        log.info("Projected ChargeCreatedEvent to PostgreSQL for chargeId: {}", chargeId);
     }
 
     private void projectSiblingVaRegistered(SiblingVaRegisteredEvent event) {
-        String entityId = UUID.randomUUID().toString();
+        UUID chargeId = parseUUID(event.chargeId());
+        if (chargeId == null) return;
+
         if (siblingVaRepo.findByBankCodeAndVaNumber(event.bankCode(), event.vaNumber()).isPresent()) {
             return; // Idempotent check
         }
         SiblingVaProjectionEntity entity = new SiblingVaProjectionEntity(
-                entityId,
-                event.chargeId(),
+                UUID.randomUUID(),
+                chargeId,
                 event.bankCode(),
                 event.vaNumber(),
                 "ACTIVE",
@@ -114,13 +118,17 @@ public class PostgresProjectionSink {
     }
 
     private void projectPaymentReceived(PaymentReceivedEvent event) {
+        UUID eventId = parseUUID(event.eventId());
+        UUID chargeId = parseUUID(event.chargeId());
+        if (eventId == null || chargeId == null) return;
+
         if (paymentRepo.findByBankCodeAndBankReference(event.bankCode(), event.bankReference()).isPresent()) {
             return; // Idempotent check
         }
 
         PaymentProjectionEntity paymentEntity = new PaymentProjectionEntity(
-                event.eventId(),
-                event.chargeId(),
+                eventId,
+                chargeId,
                 event.bankCode(),
                 event.vaNumber(),
                 event.bankReference(),
@@ -133,7 +141,7 @@ public class PostgresProjectionSink {
         paymentRepo.save(paymentEntity);
 
         // Update charge balance in PostgreSQL read model
-        chargeRepo.findById(event.chargeId()).ifPresent(charge -> {
+        chargeRepo.findById(chargeId).ifPresent(charge -> {
             BigDecimal newPaid = charge.getPaidAmount().add(event.amount());
             BigDecimal newRemaining = charge.getTotalAmount().subtract(newPaid);
             if (newRemaining.compareTo(BigDecimal.ZERO) < 0) {
@@ -151,13 +159,17 @@ public class PostgresProjectionSink {
             chargeRepo.save(charge);
         });
 
-        log.info("Projected PaymentReceivedEvent to PostgreSQL for chargeId: {}, amount: {}", event.chargeId(), event.amount());
+        log.info("Projected PaymentReceivedEvent to PostgreSQL for chargeId: {}, amount: {}", chargeId, event.amount());
     }
 
     private void projectDoubleSettlement(DoubleSettlementDetectedEvent event) {
+        UUID eventId = parseUUID(event.eventId());
+        UUID chargeId = parseUUID(event.chargeId());
+        if (eventId == null || chargeId == null) return;
+
         PaymentProjectionEntity paymentEntity = new PaymentProjectionEntity(
-                event.eventId(),
-                event.chargeId(),
+                eventId,
+                chargeId,
                 event.bankCode(),
                 event.vaNumber(),
                 event.bankReference(),
@@ -168,6 +180,16 @@ public class PostgresProjectionSink {
         );
 
         paymentRepo.save(paymentEntity);
-        log.warn("Projected DoubleSettlementDetectedEvent to PostgreSQL for chargeId: {}, bank: {}", event.chargeId(), event.bankCode());
+        log.warn("Projected DoubleSettlementDetectedEvent to PostgreSQL for chargeId: {}, bank: {}", chargeId, event.bankCode());
+    }
+
+    private UUID parseUUID(String value) {
+        if (value == null || value.isBlank()) return null;
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+            log.warn("Invalid UUID format encountered in domain event: {}", value);
+            return null;
+        }
     }
 }
