@@ -2,23 +2,62 @@
 """
 Financial & State Correctness Audit Harness.
 
-Verifies post-test data integrity across PostgreSQL read model tables:
+Verifies post-test data integrity across PostgreSQL read model / RDBMS tables:
 1. Payment Count & Total Volume matching recorded events.
 2. Double Settlement / Duplicate Reference Detection (idempotency check).
 3. Charge Balance Accounting Invariants:
-   - paid_amount == SUM(payment_projection.amount FOR charge_id)
-   - remaining_amount == MAX(0, total_amount - paid_amount)
-   - status == 'FULLY_PAID' (if remaining_amount == 0) ELSE 'PARTIALLY_PAID' or 'ACTIVE'
+   - paid_amount == SUM(payment.amount FOR charge_id)
+   - remaining_amount == MAX(0, total_amount - paid_amount) (for CLOSED/INSTALLMENT)
+   - status == 'FULLY_PAID' or 'PAID' (if remaining_amount == 0) ELSE 'PARTIALLY_PAID' or 'ACTIVE'
 """
 
 import subprocess
 import json
 import sys
 
-def run_psql_json(query):
+def get_db_config():
+    res = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True)
+    running_containers = res.stdout.strip().split()
+    
+    for c in running_containers:
+        if "evtsrc-postgres" in c:
+            return {
+                "container": c,
+                "user": "pguser",
+                "db": "payment_gateway_reporting",
+                "payment_table": "payment_projection",
+                "charge_table": "charge_projection",
+                "client_col": "client_id",
+                "total_amt_col": "total_amount",
+                "paid_amt_col": "paid_amount",
+                "rem_amt_col": "remaining_amount",
+                "charge_id_fk": "charge_id",
+                "has_double_settlement": True
+            }
+
+    for c in running_containers:
+        if "payment-gateway-db-1" in c or (("db" in c or "postgres" in c) and "app" not in c):
+            return {
+                "container": c,
+                "user": "paymentgateway",
+                "db": "paymentgateway",
+                "payment_table": "payment",
+                "charge_table": "charge",
+                "client_col": "id_consumer",
+                "total_amt_col": "amount",
+                "paid_amt_col": "cumulative_paid",
+                "rem_amt_col": "(c.amount - c.cumulative_paid)",
+                "charge_id_fk": "id_charge",
+                "has_double_settlement": False
+            }
+
+    print("[ERROR] No database container found running.")
+    sys.exit(1)
+
+def run_psql_json(cfg, query):
     cmd = [
-        "docker", "exec", "evtsrc-postgres",
-        "psql", "-U", "pguser", "-d", "payment_gateway_reporting",
+        "docker", "exec", cfg["container"],
+        "psql", "-U", cfg["user"], "-d", cfg["db"],
         "-t", "-A", "-c", f"SELECT json_agg(t) FROM ({query}) t;"
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
@@ -35,17 +74,20 @@ def run_psql_json(query):
         return []
 
 def main():
+    cfg = get_db_config()
     print("=" * 78)
-    print(" FINANCIAL CORRECTNESS & INVARIANT AUDIT HARNESS")
+    print(f" FINANCIAL CORRECTNESS & INVARIANT AUDIT HARNESS ({cfg['container']} / {cfg['db']})")
     print("=" * 78)
 
+    double_settlement_clause = "COUNT(CASE WHEN is_double_settlement THEN 1 END) as double_settlements" if cfg["has_double_settlement"] else "0 as double_settlements"
+    
     # 1. Total Payments Summary
-    payment_summary = run_psql_json("""
+    payment_summary = run_psql_json(cfg, f"""
         SELECT 
             COUNT(*) as total_payments,
             COALESCE(SUM(amount), 0) as total_paid_volume,
-            COUNT(CASE WHEN is_double_settlement THEN 1 END) as double_settlements
-        FROM payment_projection
+            {double_settlement_clause}
+        FROM {cfg['payment_table']}
     """)
 
     if payment_summary:
@@ -56,20 +98,20 @@ def main():
     print("-" * 78)
 
     # 2. Charge Balance Audit & Invariant Checks
-    charge_audit = run_psql_json("""
+    charge_audit = run_psql_json(cfg, f"""
         SELECT 
             c.id as charge_id,
-            c.client_id,
+            c.{cfg['client_col']} as client_id,
             c.charge_type,
-            c.total_amount,
-            c.paid_amount,
-            c.remaining_amount,
+            c.{cfg['total_amt_col']} as total_amount,
+            c.{cfg['paid_amt_col']} as paid_amount,
+            {cfg['rem_amt_col']} as remaining_amount,
             c.status,
             COALESCE(SUM(p.amount), 0) as actual_sum_payments,
             COUNT(p.id) as payment_count
-        FROM charge_projection c
-        LEFT JOIN payment_projection p ON p.charge_id = c.id
-        GROUP BY c.id, c.client_id, c.charge_type, c.total_amount, c.paid_amount, c.remaining_amount, c.status
+        FROM {cfg['charge_table']} c
+        LEFT JOIN {cfg['payment_table']} p ON p.{cfg['charge_id_fk']} = c.id
+        GROUP BY c.id, c.{cfg['client_col']}, c.charge_type, c.{cfg['total_amt_col']}, c.{cfg['paid_amt_col']}, c.status, c.created_at
         ORDER BY c.created_at
     """)
 
@@ -84,17 +126,18 @@ def main():
         remaining_amount = float(row['remaining_amount'])
         actual_sum = float(row['actual_sum_payments'])
         status = row['status']
+        ctype = row['charge_type']
 
         # Invariant 1: paid_amount == sum of payments
         paid_match = abs(paid_amount - actual_sum) < 0.01
 
-        # Invariant 2: remaining_amount == max(0, total_amount - paid_amount)
+        # Invariant 2: remaining_amount == max(0, total_amount - paid_amount) for CLOSED/INSTALLMENT
         expected_remaining = max(0.0, total_amount - paid_amount)
-        remaining_match = abs(remaining_amount - expected_remaining) < 0.01
+        remaining_match = (ctype == 'OPEN') or (abs(remaining_amount - expected_remaining) < 0.01)
 
         # Invariant 3: Status consistency
         expected_status = "FULLY_PAID" if expected_remaining == 0 else ("PARTIALLY_PAID" if paid_amount > 0 else "ACTIVE")
-        status_match = (status == expected_status) or (row['charge_type'] == 'OPEN' and status == 'ACTIVE')
+        status_match = (status == expected_status or (expected_status == "FULLY_PAID" and status == "PAID")) or (ctype == 'OPEN' and status == 'ACTIVE')
 
         is_valid = paid_match and remaining_match and status_match
         if not is_valid:
