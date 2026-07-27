@@ -240,3 +240,19 @@ Yes, **the RDBMS implementation is slightly faster than the Event-Sourced CQRS v
 | **Operational Complexity** | 🏆 **Low** (Single Java app + single PostgreSQL database). | **Medium-High** (Requires Kafka cluster, RocksDB state management, and CQRS projection sink). |
 | **Read/Write Decoupling** | **Coupled** (Heavy UI read queries can contend with hot-path payment transactions). | 🏆 **Fully Decoupled** (Hot-path bank callbacks touch RocksDB/Kafka; UI reads hit PostgreSQL asynchronously). |
 
+---
+
+### 8.4 Dataset Design Considerations & Scale Dynamics
+
+#### 1. Why Test with a Concentrated Seed Dataset (8 Charges, 23 VAs)?
+The benchmark deliberately utilizes a compact dataset of 8 Charges and 23 Virtual Accounts receiving **86,581 incoming HTTP payment callbacks** ($\approx 3,764$ callbacks per VA):
+- **Intentional Row-Lock Contention Stress Test**: In `payment-gateway` (RDBMS), incoming bank callbacks execute `SELECT FOR UPDATE` pessimistic locks on the parent `charge` row to serialize concurrent sibling VA payments. Directing 86,581 requests across 8 charge rows creates **extreme row-level lock contention**, thoroughly testing PostgreSQL's lock manager and WAL writer under maximum burst pressure.
+- **High Volume & Open Deposit Handling**: Out of 86,581 incoming HTTP requests, **28,875 payments** hit `OPEN` charge types (unlimited deposit wallets) and were successfully accepted and recorded in the database (accumulating IDR 2.17 Billion). The remaining callbacks hitting `CLOSED` charges were validated via idempotent status checks once the charge reached `PAID`.
+
+#### 2. Scale Dynamics: Large Datasets (10,000+ to 100,000+ Charges)
+In a production environment with 100,000+ active charges:
+- **Lock Contention Drops to Zero**: Request traffic is distributed across 100,000 distinct database rows instead of queuing behind 8 charge rows.
+- **Indexed $O(\log N)$ Read Performance**: PostgreSQL's `B-Tree` indexes on `virtual_account(va_number)` and `charge(id)` maintain sub-millisecond lookup times ($\approx 3$ B-Tree page reads for $N = 1,000,000$).
+- **Event-Sourced RocksDB Partitioning**: In `payment-gateway-evtsrc`, embedded RocksDB off-heap key-value stores (`KTable`) perform $O(1)$ memory-mapped binary lookups regardless of key count, ensuring consistent sub-millisecond hot-path validation even when scaling to millions of active VAs across multiple Kafka partitions.
+
+
