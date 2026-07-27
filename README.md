@@ -721,7 +721,7 @@ To quantitatively validate the architectural claims of `payment-gateway-evtsrc` 
 
 ### 5.3 Measured Benchmark Performance Matrix
 
-> **Benchmark Date**: 2026-07-26. Two consecutive k6 runs on shared single-node hardware (Apple M5, 10-core, 16GB). Full report: [`perf_benchmark_report.md`](scenarios/perf_benchmark_report.md).
+> **Benchmark Date**: 2026-07-26. Two consecutive k6 runs on shared single-node hardware (Apple M5, 10-core, 16GB).
 
 #### Measured Metrics (Event-Sourced CQRS — `payment-gateway-evtsrc`)
 
