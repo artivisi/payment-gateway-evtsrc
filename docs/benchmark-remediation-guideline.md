@@ -353,6 +353,36 @@ system's tests and even its own live-load run can pass cleanly while quietly enc
 misunderstanding of its own domain model — it takes a second, independent implementation
 disagreeing on the numbers to surface it.
 
+### Fourth gap: a real financial-correctness defect, found only by testing against a fresh database twice (2026-07-29)
+
+Every run behind the Third gap's fix, and behind acceptance criterion 4 below, was against a
+database that had accumulated state from a prior run on the same day (RDBMS's second run) or was
+otherwise not repeated to check reproducibility. Re-running both systems from a completely empty
+database (schema dropped and recreated, Kafka topics and the local RocksDB `target/rocksdb`
+directory wiped for evtsrc) surfaced two things a same-day, same-database pairing had not:
+
+1. **evtsrc saturates well before 2,000 TPS; RDBMS does not**, on the same shared hardware, same
+   ramp. RDBMS: p99 51ms, 156 VUs needed. evtsrc: p99 3.22s and 1.16s across two independently-reset
+   runs, 1,200+ VUs needed, tail latency still climbing at ramp-down rather than recovering. See
+   `scenarios/perf_benchmark_report.md` §3.
+2. **evtsrc's financial-correctness audit failed in both fresh runs** — a single `bankReference` was
+   recorded twice (once accepted, once flagged as a double settlement) for the same charge, once per
+   run, both times on a charge that had just been created. RDBMS's audit passed cleanly in its one
+   run. The exact mechanism was not conclusively identified: ruled out a k6-side duplicate
+   `idTransaksi`, a Kafka consumer-group rebalance (none logged), and plain redelivery of the same
+   Kafka record (the topology's own duplicate-skip guard never fired). All three of evtsrc's Kafka
+   Streams state stores use `Stores.persistentKeyValueStore(...)` with no `.withCachingDisabled()`,
+   so the default record cache is active on all of them — a plausible contributor to interactive-query
+   staleness, but not confirmed as the root cause. See `scenarios/perf_benchmark_report.md` §4 for
+   what was ruled in/out and what a real root-cause pass would need (DEBUG-level Streams logging, or
+   a rerun with caching explicitly disabled).
+
+The defect was run twice specifically because the first occurrence looked like it could have been a
+fluke (one anomalous row out of ~78,000 requests). It reproduced identically in kind (not in exact
+value) on the second independently-reset run, which is what turned "possibly noise" into "a real,
+reproducible characteristic of this design under saturation." A single run — however clean — would
+not have distinguished those two possibilities.
+
 ### Acceptance criteria for the re-benchmark
 
 1. [DONE] Both systems benchmarked through the same adapter protocol, same seed, same script, same
@@ -364,9 +394,13 @@ disagreeing on the numbers to surface it.
 3. [DONE] Double-settlement race demonstrably detected and flagged (a test that fires two concurrent
    full payments at one CLOSED charge and finds exactly one applied + one flagged).
 4. [DONE] Audit passes per G7 on both systems, cross-checked against the load generator's outcome
-   log -- all four runs (2 per system). Projection lag was not explicitly polled to zero before
-   auditing; the audits passing cleanly (no missing rows) is strong circumstantial evidence it had
-   drained, not a directly measured guarantee.
+   log -- all four 2026-07-28 runs (2 per system). Projection lag was not explicitly polled to zero
+   before auditing; the audits passing cleanly (no missing rows) is strong circumstantial evidence it
+   had drained, not a directly measured guarantee. Superseded by the Fourth gap above: re-run against
+   a fresh database on 2026-07-29, the audit found a real defect in evtsrc (not the RDBMS baseline)
+   in both of two independent runs. "Audit passes" was a property of that day's specific runs, not a
+   proof the system has no residual correctness gap -- exactly the kind of thing only surfaces by
+   re-testing under different conditions (fresh state) rather than trusting a prior green result.
 5. [DONE] The report states accepted-payment counts and double-settlement-rejection counts
    separately per system per run (`scenarios/perf_benchmark_report.md` §5). A real knee/saturation
    analysis, time-bucketed from the actual `--out json` raw export by the new

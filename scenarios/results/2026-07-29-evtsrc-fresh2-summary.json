@@ -1,0 +1,175 @@
+{
+    "metrics": {
+        "checks": {
+            "fails": 0,
+            "passes": 79240,
+            "value": 1
+        },
+        "dropped_iterations": {
+            "count": 7384,
+            "rate": 80.89246562711084
+        },
+        "vus_max": {
+            "value": 1213,
+            "min": 100,
+            "max": 1213
+        },
+        "payment_outcomes": {
+            "count": 79240,
+            "rate": 868.0822015563737
+        },
+        "http_req_connecting": {
+            "p(95)": 0,
+            "avg": 0.00900850451723614,
+            "min": 0,
+            "med": 0,
+            "max": 48.319,
+            "p(90)": 0
+        },
+        "iterations": {
+            "count": 79240,
+            "rate": 868.0822015563737
+        },
+        "http_req_receiving": {
+            "max": 550.438,
+            "p(90)": 0.936,
+            "p(95)": 3.356,
+            "avg": 1.5908864003432057,
+            "min": 0.004,
+            "med": 0.049
+        },
+        "http_req_blocked": {
+            "max": 377.692,
+            "p(90)": 0.079,
+            "p(95)": 0.194,
+            "avg": 0.07675253621360001,
+            "min": 0,
+            "med": 0.015
+        },
+        "data_received": {
+            "count": 22741700,
+            "rate": 249137.61992850306
+        },
+        "http_req_duration": {
+            "max": 1414.102,
+            "p(90)": 424.95040000000006,
+            "p(95)": 592.0138,
+            "avg": 136.04356361984657,
+            "min": 0.641,
+            "med": 27.9095,
+            "thresholds": {
+                "p(99)<500": true
+            }
+        },
+        "http_reqs": {
+            "count": 79252,
+            "rate": 868.2136627681188
+        },
+        "http_req_duration{expected_response:true}": {
+            "med": 27.9095,
+            "max": 1414.102,
+            "p(90)": 424.95040000000006,
+            "p(95)": 592.0138,
+            "avg": 136.04356361984657,
+            "min": 0.641
+        },
+        "http_req_tls_handshaking": {
+            "avg": 0,
+            "min": 0,
+            "med": 0,
+            "max": 0,
+            "p(90)": 0,
+            "p(95)": 0
+        },
+        "data_sent": {
+            "count": 27357998,
+            "rate": 299709.63066651777
+        },
+        "iteration_duration": {
+            "min": 10.719791,
+            "med": 40.2046045,
+            "max": 1903.405792,
+            "p(90)": 449.54877980000003,
+            "p(95)": 621.3247097499998,
+            "avg": 151.1427682735106
+        },
+        "http_req_sending": {
+            "avg": 0.5636655857265408,
+            "min": 0.001,
+            "med": 0.041,
+            "max": 402.263,
+            "p(90)": 0.451,
+            "p(95)": 1.4994499999999966
+        },
+        "http_req_failed": {
+            "passes": 0,
+            "fails": 79252,
+            "thresholds": {
+                "rate<0.01": false
+            },
+            "value": 0
+        },
+        "http_req_waiting": {
+            "avg": 133.8890116337748,
+            "min": 0.619,
+            "med": 27.159,
+            "max": 1413.884,
+            "p(90)": 417.4083000000001,
+            "p(95)": 577.6338499999997
+        },
+        "vus": {
+            "max": 1168,
+            "value": 0,
+            "min": 0
+        }
+    },
+    "setup_data": {
+        "vas": [
+            {
+                "paymentAmount": 2500000,
+                "vaNumber": "99012026001",
+                "chargeId": "742bac74-39d8-4ac7-9f80-cf0b441a08eb"
+            },
+            {
+                "paymentAmount": 3200000,
+                "vaNumber": "99012026002",
+                "chargeId": "9cf55c81-67c5-4921-9291-52e7d35e8da7"
+            },
+            {
+                "chargeId": "5d0b3e04-cf38-4017-9bdc-e7676918ced0",
+                "paymentAmount": 50000,
+                "vaNumber": "99012026003"
+            },
+            {
+                "chargeId": "05f106b0-588d-4f4b-a65e-418fbdb7f8e4",
+                "paymentAmount": 1000000,
+                "vaNumber": "99012026004"
+            },
+            {
+                "chargeId": "07ff836f-373a-4d32-8d64-b729c4d2eb8e",
+                "paymentAmount": 450000,
+                "vaNumber": "99022026002"
+            },
+            {
+                "chargeId": "9e0d8b43-3b43-4d5f-a412-69502be57af4",
+                "paymentAmount": 100000,
+                "vaNumber": "99032026001"
+            }
+        ]
+    },
+    "root_group": {
+        "checks": {
+            "status is 200": {
+                "name": "status is 200",
+                "path": "::status is 200",
+                "id": "6210a8cd14cd70477eba5c5e4cb3fb5f",
+                "passes": 79240,
+                "fails": 0
+            }
+        },
+        "name": "",
+        "path": "",
+        "id": "d41d8cd98f00b204e9800998ecf8427e",
+        "groups": {}
+    }
+}
