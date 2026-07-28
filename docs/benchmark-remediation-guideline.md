@@ -329,6 +329,30 @@ Neither of these would have been caught without actually running the packaged ap
 real infrastructure and real load — a reminder that a green test suite bounds what's broken, it
 doesn't prove nothing is.
 
+### Third gap: OPEN charges were incorrectly capped, sourced from a wrong domain-model assumption (2026-07-28)
+
+The RDBMS-side comparison run (`scenarios/perf_benchmark_report.md` §8) initially reported evtsrc
+accepting only 209 payments against the RDBMS baseline's 28,953, framed as "a genuine behavioral
+difference, not a bug in either system." That framing was wrong. The actual bug: `payment-gateway/CLAUDE.md`'s
+charge lifecycle section grouped OPEN with INSTALLMENT under one closing rule
+("when `cumulativePaid ≥ amount` the charge is `PAID`") — but the RDBMS baseline's own
+`PaymentApplicationService.applyOpen()` is explicit: "Persistent, free amount, repeated payments:
+accumulate, never auto-complete, keep siblings open." OPEN is a standing/always-active account
+(e.g. a donation VA) with no cap; INSTALLMENT is the type that enforces a target amount. Trusting
+the (wrong) grouped documentation, both `PaymentGatewayStreamsTopology.PaymentEventProcessor` and
+`PostgresProjectionSink` implemented OPEN identically to CLOSED/INSTALLMENT — capping at
+`totalAmount` and marking the charge terminal. Fixed in both write paths (check `chargeType`, never
+transition an OPEN charge to `PAID`/`FULLY_PAID`); `payment-gateway/CLAUDE.md` corrected to
+separate the two rules (that repo's own fix — not committed by this session, since it was outside
+evtsrc's scope; it needs a commit there to persist). With both fixed, evtsrc's accepted-payment
+count on a fresh run (28,897) closely tracks the RDBMS baseline's (28,953).
+
+A third reminder alongside the first two: this was caught by actually comparing real numbers
+between two independently-implemented systems, not by testing either one in isolation. A single
+system's tests and even its own live-load run can pass cleanly while quietly encoding a
+misunderstanding of its own domain model — it takes a second, independent implementation
+disagreeing on the numbers to surface it.
+
 ### Acceptance criteria for the re-benchmark
 
 1. Both systems benchmarked through the same adapter protocol, same seed, same script, same

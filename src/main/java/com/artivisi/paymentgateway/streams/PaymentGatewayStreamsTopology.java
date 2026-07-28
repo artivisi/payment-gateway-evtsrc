@@ -38,12 +38,17 @@ import java.util.UUID;
  * 3. payment-events -> idempotency-store & charge-state-store: PaymentEventProcessor is the single
  *    authoritative serialization point per partition key (chargeId). It re-checks idempotency,
  *    re-checks the charge's terminal status, and either applies the payment (cumulativePaid +=
- *    amount, terminal at cumulativePaid >= totalAmount) or emits a DoubleSettlementDetectedEvent
- *    back onto payment-events instead of silently absorbing an overpayment.
+ *    amount, terminal at cumulativePaid >= totalAmount for CLOSED/INSTALLMENT only) or emits a
+ *    DoubleSettlementDetectedEvent back onto payment-events instead of silently absorbing an
+ *    overpayment. OPEN charges never reach a terminal state -- they are a standing/always-active
+ *    account (e.g. a donation VA) that accumulates indefinitely; see
+ *    payment-gateway/CLAUDE.md's charge lifecycle section.
  *
- * Every sibling VA of a charge resolves via va-registry-store to the SAME chargeId, so marking
- * the charge PAID here is the sibling-retirement mechanism: a later inquiry or payment attempt
- * against ANY sibling VA observes status PAID. No separate per-VA cancellation bookkeeping exists.
+ * Every sibling VA of a CLOSED/INSTALLMENT charge resolves via va-registry-store to the SAME
+ * chargeId, so marking the charge PAID here is the sibling-retirement mechanism: a later inquiry
+ * or payment attempt against ANY sibling VA observes status PAID. No separate per-VA cancellation
+ * bookkeeping exists. OPEN charges never retire their siblings this way -- by design, every
+ * sibling stays open for the life of the charge.
  */
 @Component
 public class PaymentGatewayStreamsTopology {
@@ -282,10 +287,16 @@ public class PaymentGatewayStreamsTopology {
             BigDecimal cumulativePaid = chargeNode.hasNonNull("cumulativePaid")
                     ? new BigDecimal(chargeNode.get("cumulativePaid").asString())
                     : BigDecimal.ZERO;
+            String chargeType = chargeNode.hasNonNull("chargeType") ? chargeNode.get("chargeType").asString() : null;
 
             BigDecimal newCumulativePaid = cumulativePaid.add(payment.amount());
             chargeNode.put("cumulativePaid", newCumulativePaid.toPlainString());
-            if (newCumulativePaid.compareTo(totalAmount) >= 0) {
+            // OPEN is a standing/always-active account (e.g. a donation VA): it accumulates
+            // indefinitely and never reaches a terminal PAID state -- amount is a nominal display
+            // target, not an enforced cap. Only CLOSED/INSTALLMENT close once cumulativePaid
+            // reaches the target amount. See payment-gateway/CLAUDE.md's charge lifecycle section
+            // and PaymentApplicationService.applyOpen()'s "never auto-complete" comment.
+            if (!"OPEN".equals(chargeType) && newCumulativePaid.compareTo(totalAmount) >= 0) {
                 chargeNode.put("status", CHARGE_STATUS_PAID);
             }
 
