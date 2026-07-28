@@ -638,7 +638,7 @@ flowchart TD
 
 ---
 
-### 4.3 Event Stream Replay & Projection Rebuild Runbook
+### 4.5 Event Stream Replay & Projection Rebuild Runbook
 
 One of the key benefits of this Event Sourcing setup is the ability to wipe the PostgreSQL reporting database and rebuild all read models from genesis:
 
@@ -654,158 +654,28 @@ One of the key benefits of this Event Sourcing setup is the ability to wipe the 
 
 ---
 
----
+## 5. Performance Benchmark & Comparison
 
-## 5. Performance Benchmark & Comparison Scenarios
+Both repositories are benchmarked through the identical real BSI proprietary adapter workload
+(`POST /api/bank/bsi`, full SHA-1 checksum, `scenarios/suite-bsi.js` here / `scenarios/suite-rdbms.js`
+on the RDBMS side), a `ramping-arrival-rate` profile from 50 to 2,000 TPS over 90 seconds, on the
+same 6 BSI VA/amount pairs from `scenarios/seed-data.json`. Both scripts require `RUN_ID` and
+`BSI_SHARED_SECRET` as environment variables with no default (a missing value throws in the k6 init
+stage — the exact "empty/`\"null\"` secret" bug this replaces is documented in
+`docs/benchmark-remediation-guideline.md` finding F5).
 
-To quantitatively validate the architectural claims of `payment-gateway-evtsrc` against the relational `payment-gateway` baseline, both repositories are benchmarked using identical hardware allocations and load testing tools (**k6**).
+**Full methodology, both runs' numbers, the financial-correctness audit, and a real finding about
+performance degrading under sustained load on a small hot-row dataset are in
+[`scenarios/perf_benchmark_report.md`](scenarios/perf_benchmark_report.md).** Headline result: both
+systems pass their error-rate and p99 thresholds; RDBMS is faster at the median (a single SQL
+transaction vs. three RocksDB queries plus a Kafka round-trip), evtsrc holds up better under
+sustained contention on the same small set of rows.
 
-> **Prior to this remediation, workload not comparable to the current suite.** All measured figures in §5.2–§5.3 below were captured against the retired `scenarios/suite.js`, which hit a generic, unauthenticated `/api/v1/payments` endpoint with the caller supplying `chargeId` directly and no server-side pre-validation (see `docs/benchmark-remediation-guideline.md` findings F1/F5/F7). That code path no longer exists — the hot path now does real idempotency/VA/charge-status pre-validation against RocksDB (§3.5). The numbers below are kept as historical record only; they do not describe the current implementation and must not be read as current or valid. A fresh benchmark against the corrected workload (§5.4) has not yet been run.
-
-### 5.1 Benchmark Environment & Hardware Under Test
-
-| Component | Specification |
-|---|---|
-| **Machine** | Apple Mac17,3 |
-| **CPU** | Apple M5 — 10 cores |
-| **RAM** | 16 GB |
-| **OS** | macOS (arm64) |
-| **JDK** | Eclipse Temurin 25.0.3+9 |
-| **Spring Boot** | 4.1.0 |
-| **Kafka** | `apache/kafka:latest` (KRaft mode, single broker, Docker container) |
-| **PostgreSQL** | PostgreSQL 18 (Docker container) |
-| **RocksDB** | `rocksdbjni` 10.10.1.1 (embedded, `./target/rocksdb`) |
-| **Load Test Tool** | k6 v0.55+ (Grafana Labs) |
-
-> **Note**: All components (App JVM, Kafka broker, PostgreSQL) ran on the **same physical machine** sharing CPU and memory. Production deployments on dedicated infrastructure would yield significantly better results.
-
-- **Pre-populated Dataset** (`scenarios/seed-data.json`, counted directly from the file): 8 charges (5 `CLOSED`, 2 `OPEN`, 1 `INSTALLMENT`) with **23** sibling VAs across 6 banks (MAYBANK, BSI, CIMB, BCA, BNI, BRI) and 3 client institutions (`CLIENT-UNIVERSITAS-TAZKIA`, `CLIENT-RUMAH-SAKIT-ISLAM`, `CLIENT-FOUNDATION-PEDULI`). Of the 23 VAs, 6 are BSI — the set the current `scenarios/suite-bsi.js` workload (§5.4) drives.
-
----
-
-### 5.2 Benchmark Test Scenarios
-
-#### Scenario A: High-Concurrency Bank Callbacks (Tuition Deadline Peak) — ⚠️ Executed prior to this remediation, not comparable to the current suite
-- **Goal**: Measure maximum callback throughput (TPS), response latency ($p_{95}, p_{99}$), and financial correctness during peak payment bursts.
-- **Workload (historical)**: `POST /api/v1/payments` against the now-retired generic endpoint (simulated multi-bank callbacks across 6 banks, caller-supplied `chargeId`, no pre-validation) using `ramping-arrival-rate` executor ramping from 100 → 500 → 1,000 → 2,000 TPS over 90 seconds with up to 2,000 concurrent VUs. The current workload is `scenarios/suite-bsi.js` against `/api/bank/bsi` (§5.4).
-- **Measured Result, historical** (see §5.3 for full metrics; kept for record, not current):
-  - `payment-gateway-evtsrc`: **0.00% error rate** across 113,594 total requests. Min latency **875 µs**. Sustained ~750 TPS with sub-10ms p99 (linear zone). Peak throughput ~2,000 TPS (VU-limited). **Zero double settlements** — but this run predates any double-settlement detection code (see `docs/benchmark-remediation-guideline.md` F2): the figure reflects an absent check, not a verified invariant.
-  - `payment-gateway` (RDBMS): *Not yet benchmarked under the current suite* — to be tested with `scenarios/suite-bsi.js` for direct comparison.
-
-#### Scenario B: Concurrent EOD Reconciliation Import + Live Callback Traffic
-- **Goal**: Evaluate write isolation when heavy batch processing runs concurrently with live bank callbacks.
-- **Workload**: Import a 50,000-row End-of-Day (EOD) bank settlement CSV while simultaneously serving 1,000 TPS real-time callbacks.
-- **Expected Result**:
-  - `payment-gateway-evtsrc`: Callback SLA remains unaffected ($p_{99} < 1\text{ms}$), as CSV import runs off-path and streams events asynchronously into Kafka.
-  - `payment-gateway` (RDBMS): Heavy batch inserts and table locks on PostgreSQL cause callback response times to spike ($>200\text{ms}$) due to DB disk IOPS contention.
-
-#### Scenario C: Read-Heavy Web UI Reporting Under Write Stress
-- **Goal**: Measure write-read decoupling performance.
-- **Workload**: 50 concurrent operator UI sessions executing paginated filtering, transaction export, and reconciliation dashboard queries on PostgreSQL while 2,000 TPS callbacks hit the API.
-- **Expected Result**:
-  - `payment-gateway-evtsrc`: Web UI queries run against the PostgreSQL 18 projection sink without blocking or affecting bank callback ingress.
-  - `payment-gateway` (RDBMS): Shared connection pool and shared DB IOPS cause both UI rendering delays and callback latency spikes.
-
-#### Scenario D: Outage & Fault Isolation Test
-- **Goal**: Evaluate how component failures impact bank callback availability across both architectures.
-
-1. **Test D1: Reporting Database Outage (Stop PostgreSQL Container)**
-   - **Workload**: Terminate PostgreSQL 18 container while 1,000 TPS callback traffic is active.
-   - **`payment-gateway-evtsrc`**: **100% callback success rate**. Callbacks validate against local RocksDB and append to Kafka without touching Postgres. When Postgres recovers, the projection sink catches up asynchronously.
-   - **`payment-gateway` (RDBMS)**: **100% callback failure rate** (`500 Internal Server Error` / DB Connection Refused) because PostgreSQL handles both writes and reads.
-
-2. **Test D2: Primary Event Log / Write Engine Outage (Stop Kafka Broker / RDBMS Primary)**
-   - **Workload**: Terminate the Primary Write Engine (Kafka Broker in CQRS vs Primary DB in RDBMS) without HA quorum.
-   - **`payment-gateway-evtsrc`**: **100% callback failure rate** (Cannot append events to Kafka source of truth).
-   - **`payment-gateway` (RDBMS)**: **100% callback failure rate** (Cannot commit SQL transaction to Primary DB).
-   - *Architectural Takeaway*: If the primary source of truth write log of *either* system is completely offline without HA quorum, new write commands cannot be accepted by definition.
-
-3. **Test D3: Single-Node Failover SLA in High-Availability Setup**
-   - **Workload**: Simulate 1 node failure in a 3-node production cluster.
-   - **`payment-gateway-evtsrc`**: Peer instance promotes warm local RocksDB standby replica in **$<1\text{ second}$**.
-   - **`payment-gateway` (RDBMS)**: Patroni failover promotes DB replica in **$10\text{--}30\text{ seconds}$**, during which active callbacks time out.
-
----
-
-### 5.3 Measured Benchmark Performance Matrix — historical, prior to this remediation, not comparable to a future re-run
-
-> **Benchmark Date**: 2026-07-26. Two consecutive k6 runs on shared single-node hardware (Apple M5, 10-core, 16GB), against the retired generic `/api/v1/payments` endpoint described in §5.2. Full report: [`perf_benchmark_report.md`](scenarios/perf_benchmark_report.md) (its own §8 head-to-head table has been removed as untraceable — see that file's "Re-benchmark Required" section). No re-benchmark against the current hot path (§3.5) or the current BSI-protocol suite (§5.4) has been run yet; do not treat the figures below as current.
-
-#### Measured Metrics (Event-Sourced CQRS — `payment-gateway-evtsrc`)
-
-| Metric | Run 1 (Warm JVM) | Run 2 (Accumulated State) |
-|---|---|---|
-| **Total Requests** | 62,971 | 50,623 |
-| **HTTP Error Rate** | **0.00%** | **0.00%** |
-| **Min Latency** | 1.24 ms | **875 µs** |
-| **Median Latency (p50)** | 553.55 ms | 2.66 s |
-| **p90 Latency** | 2.61 s | 3.49 s |
-| **p95 Latency** | 2.89 s | 3.69 s |
-| **p99 Latency** | 3.30 s | 3.86 s |
-| **Max Latency** | 3.47 s | 4.12 s |
-| **Effective Avg Throughput** | 698.83 req/s | 560.55 req/s |
-| **Dropped Iterations** | 23,654 | 36,001 |
-
-#### Performance Curve — Knee & Saturation Analysis
-
-| Phase | TPS Range | Active VUs | Latency | Behavior |
-|---|---|---|---|---|
-| **Linear Scaling** | 0 – 750 TPS | 4 – 100 | **< 10 ms** | Throughput scales linearly. Zero queue backlog. |
-| **Knee Point** | 800 – 1,000 TPS | 100 – 250 | 10 ms → 500 ms | Tomcat worker threads begin queuing. Median latency crosses 100ms. |
-| **Saturation Plateau** | 1,000 – 2,000 TPS | 250 – 2,000 | 500 ms → 3.3 s | VU cap (2,000) reached. Kafka producer and JVM GC contend for shared CPU. |
-
-> **Key Finding**: The benchmark was **VU-limited, not server-limited**. Even at full 2,000 VU saturation, zero requests were rejected. The true throughput ceiling on dedicated hardware would be significantly higher.
-
-#### Financial Correctness Audit (Post-Test)
-
-| Invariant | Result |
-|---|---|
-| Total Payments Recorded | 1,119 |
-| Total Paid Volume | IDR 1,943,800,000.00 |
-| Double Settlements | **0** |
-| `paid_amount == SUM(payments)` | ✅ All charges |
-| `remaining_amount == MAX(0, total - paid)` | ✅ All charges |
-| Status consistency (`FULLY_PAID` / `PARTIALLY_PAID` / `ACTIVE`) | ✅ All charges |
-| Integration Test Suite | **12 tests passed, 0 failures** |
-
-#### Comparative Summary
-
-| Benchmark Metric | Event-Sourced CQRS *(Measured)* | Traditional RDBMS *(Pending)* |
-|---|---|---|
-| **Sustained TPS (sub-10ms p99)** | **~750 TPS** (single shared node) | *To be benchmarked* |
-| **Peak TPS (VU-limited)** | **~2,000 TPS** | *To be benchmarked* |
-| **Min Latency** | **875 µs** | *To be benchmarked* |
-| **Error Rate (113,594 requests)** | **0.00%** | *To be benchmarked* |
-| **Double Settlements** | **0** | *To be benchmarked* |
-
----
-
-### 5.4 Shared BSI-Protocol k6 Workload
-
-The two repositories do **not** share a generic endpoint — `payment-gateway-evtsrc`'s earlier `scenarios/suite.js` hit a synthetic `/api/v1/payments` shape with no counterpart benchmarked seriously on the RDBMS side, and it exercised no real validation (`docs/benchmark-remediation-guideline.md`, findings F1/F5/F7). `scenarios/suite.js` now throws immediately on execution, pointing here instead of silently running that workload.
-
-The comparable workload is the **real BSI proprietary adapter**, implemented on both sides at `POST /api/bank/bsi` with identical checksum (`SHA1(nomorPembayaran + secret + tanggalTransaksi)`) and response-code semantics:
-
-- `payment-gateway-evtsrc`: `scenarios/suite-bsi.js` — the canonical script, targeting this repo's `BsiAdapterController` on its own port.
-- `payment-gateway` (RDBMS): `scenarios/suite-rdbms.js`, kept in this repo's `scenarios/` as a read-only reference copy of the sibling repo's real BSI-adapter script (the sibling `payment-gateway` repo has no k6 scripts of its own today) — run it with `TARGET_URL` pointed at the RDBMS gateway's port instead.
-
-Both scripts drive the same 6 BSI VA/amount pairs from `scenarios/seed-data.json`, the same `ramping-arrival-rate` profile (`startRate: 50`), and both require `RUN_ID` and `BSI_SHARED_SECRET` as environment variables with no default — a missing value throws in the k6 init stage rather than silently falling back to an empty/`"null"` secret (the exact bug that made the old checksum trivially forgeable). `RUN_ID` prefixes every generated `idTransaksi`/`bankReference` so one run's payments can be isolated from an accumulating audit table, and every payment POST is classified into the `payment_outcomes` k6 metric from the in-body `responseCode`, not HTTP status.
-
-```bash
-# evtsrc gateway — wraps the exact k6 invocation and writes traceable artifacts
-export RUN_ID=$(date +%Y%m%d%H%M%S)
-export BSI_SHARED_SECRET=<value matching app.bank-secrets.secrets.bsi on the running app>
-./scenarios/run-benchmark.sh http://localhost:8080
-
-# RDBMS gateway — same RUN_ID and BSI_SHARED_SECRET, same escrow secret configured on that app
-RUN_ID=$RUN_ID BSI_SHARED_SECRET=$BSI_SHARED_SECRET k6 run \
-  -e TARGET_URL=http://localhost:8082 \
-  --summary-export=scenarios/results/$(date +%Y-%m-%d)-rdbms-summary.json \
-  --out json=scenarios/results/$(date +%Y-%m-%d)-rdbms-raw.json \
-  scenarios/suite-rdbms.js
-```
-
-Raw and summary JSON from every run belong under `scenarios/results/` (see `scenarios/results/README.md` for the artifact-naming contract) — no number is reported in `perf_benchmark_report.md` without a committed file behind it. As of this writing, no full-ramp run of this shared suite has been executed against either system (a syntax/init check and a small manual smoke test were run during development, not a measured benchmark) — §5.2/§5.3 above remain the only numbers on record, and they predate this suite. `scenarios/suite-rdbms.js` also still needs the RDBMS gateway configured with a real, non-`NULL` escrow secret before a legitimate comparison run — see `docs/benchmark-remediation-guideline.md` F5.
+Reproduce with `./scenarios/run-benchmark.sh <target-url>` (evtsrc) or the equivalent direct `k6 run`
+invocation documented in `suite-rdbms.js`'s header (RDBMS), then audit with
+`scenarios/verify-correctness.py --k6-results ... --run-id ...` (pass `--target evtsrc` or
+`--target rdbms` if both systems' database containers are running at once — auto-detection refuses
+to guess in that case).
 
 ---
 

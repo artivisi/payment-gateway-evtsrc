@@ -37,45 +37,79 @@ import urllib.request
 # is_evtsrc flag used to gate PRIMARY CHECK 2).
 # ------------------------------------------------------------------------------------------
 
-def get_db_config():
+EVTSRC_CONFIG_TEMPLATE = {
+    "user": "pguser",
+    "db": "payment_gateway_reporting",
+    "payment_table": "payment_projection",
+    "charge_table": "charge_projection",
+    "client_col": "client_id",
+    "total_amt_col": "total_amount",
+    "paid_amt_col": "paid_amount",
+    "rem_amt_col": "remaining_amount",
+    "charge_id_fk": "charge_id",
+    "bank_ref_col": "bank_reference",
+    "has_double_settlement": True,
+    "is_evtsrc": True,
+}
+
+RDBMS_CONFIG_TEMPLATE = {
+    "user": "paymentgateway",
+    "db": "paymentgateway",
+    "payment_table": "payment",
+    "charge_table": "charge",
+    "client_col": "id_consumer",
+    "total_amt_col": "amount",
+    "paid_amt_col": "cumulative_paid",
+    "rem_amt_col": "(c.amount - c.cumulative_paid)",
+    "charge_id_fk": "id_charge",
+    "bank_ref_col": "bank_reference",
+    "has_double_settlement": False,
+    "is_evtsrc": False,
+}
+
+
+def get_db_config(target=None):
+    """
+    target: None (auto-detect), "evtsrc", or "rdbms". Auto-detection is only safe when exactly one
+    stack's Postgres container is running. Running both simultaneously -- exactly what a real
+    side-by-side benchmark comparison does -- previously made this silently match evtsrc first
+    regardless of which system's run you meant to audit, auditing the wrong database with no
+    warning. Now: with both running, --target is required; guessing is not an option.
+    """
     res = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True)
     running_containers = res.stdout.strip().split()
 
-    for c in running_containers:
-        if "evtsrc-postgres" in c:
-            return {
-                "container": c,
-                "user": "pguser",
-                "db": "payment_gateway_reporting",
-                "payment_table": "payment_projection",
-                "charge_table": "charge_projection",
-                "client_col": "client_id",
-                "total_amt_col": "total_amount",
-                "paid_amt_col": "paid_amount",
-                "rem_amt_col": "remaining_amount",
-                "charge_id_fk": "charge_id",
-                "bank_ref_col": "bank_reference",
-                "has_double_settlement": True,
-                "is_evtsrc": True,
-            }
+    evtsrc_container = next((c for c in running_containers if "evtsrc-postgres" in c), None)
+    rdbms_container = next(
+        (c for c in running_containers
+         if "payment-gateway-db-1" in c or (("db" in c or "postgres" in c) and "app" not in c and "evtsrc" not in c)),
+        None,
+    )
 
-    for c in running_containers:
-        if "payment-gateway-db-1" in c or (("db" in c or "postgres" in c) and "app" not in c):
-            return {
-                "container": c,
-                "user": "paymentgateway",
-                "db": "paymentgateway",
-                "payment_table": "payment",
-                "charge_table": "charge",
-                "client_col": "id_consumer",
-                "total_amt_col": "amount",
-                "paid_amt_col": "cumulative_paid",
-                "rem_amt_col": "(c.amount - c.cumulative_paid)",
-                "charge_id_fk": "id_charge",
-                "bank_ref_col": "bank_reference",
-                "has_double_settlement": False,
-                "is_evtsrc": False,
-            }
+    if target == "evtsrc":
+        if not evtsrc_container:
+            print("[ERROR] --target evtsrc given, but no evtsrc-postgres container is running.")
+            sys.exit(1)
+        return {"container": evtsrc_container, **EVTSRC_CONFIG_TEMPLATE}
+
+    if target == "rdbms":
+        if not rdbms_container:
+            print("[ERROR] --target rdbms given, but no payment-gateway-db-1 (or equivalent) container is running.")
+            sys.exit(1)
+        return {"container": rdbms_container, **RDBMS_CONFIG_TEMPLATE}
+
+    if evtsrc_container and rdbms_container:
+        print(
+            "[ERROR] Both an evtsrc-postgres container ({}) and an RDBMS container ({}) are "
+            "running -- auto-detection cannot know which run you mean to audit. Pass "
+            "--target evtsrc or --target rdbms explicitly.".format(evtsrc_container, rdbms_container)
+        )
+        sys.exit(1)
+
+    if evtsrc_container:
+        return {"container": evtsrc_container, **EVTSRC_CONFIG_TEMPLATE}
+    if rdbms_container:
+        return {"container": rdbms_container, **RDBMS_CONFIG_TEMPLATE}
 
     print("[ERROR] No database container found running.")
     sys.exit(1)
@@ -136,6 +170,15 @@ def parse_args():
         help="Base URL of the running evtsrc app, used only for PRIMARY CHECK 2 "
              "(GET /api/v1/charges/{id} against the RocksDB-backed charge-state-store). Ignored "
              "when the detected database is the RDBMS baseline. Default: http://localhost:8081.",
+    )
+    parser.add_argument(
+        "--target",
+        choices=["evtsrc", "rdbms"],
+        default=None,
+        help="Which system's database to audit. Required when both an evtsrc-postgres container "
+             "and an RDBMS container are running simultaneously (e.g. during a side-by-side "
+             "benchmark) -- auto-detection cannot disambiguate that case and will refuse to guess. "
+             "Optional when only one is running.",
     )
     return parser.parse_args()
 
@@ -567,7 +610,7 @@ def print_secondary_sink_consistency_check(cfg, charge_audit):
 def main():
     args = parse_args()
     ground_truth = load_k6_ground_truth(args.k6_results, args.run_id)
-    cfg = get_db_config()
+    cfg = get_db_config(args.target)
 
     print("=" * 78)
     print(f" FINANCIAL CORRECTNESS & INVARIANT AUDIT HARNESS ({cfg['container']} / {cfg['db']})")
