@@ -300,6 +300,35 @@ build as of this note — treat any `[DONE]` tag above as scoped to what its own
 not as a claim that every test that touches that area is race-free; this section is what closed
 the gap between "the stage agent said PASS" and "an independent, repeated run says PASS."
 
+### Second gap: `mvn test` passing does not mean the packaged app runs correctly (2026-07-28)
+
+Actually running the corrected implementation as a real deployed app (fresh Postgres + Kafka
+containers, packaged jar, real BSI checksum traffic via k6 — see
+`scenarios/perf_benchmark_report.md` §8) surfaced two more bugs that 21/21 green tests never could,
+because both are specifically about the gap between the test harness and a real deployment:
+
+1. **Flyway never migrated anything.** `pom.xml` declared bare `flyway-core` +
+   `flyway-database-postgresql` but not the Spring Boot 4 starter
+   (`org.springframework.boot:spring-boot-flyway`) that actually wires
+   `FlywayAutoConfiguration` — Spring Boot 4 split autoconfiguration into per-module starters, and a
+   library on the classpath without its starter does not autoconfigure. Result: zero tables ever
+   created, zero errors logged, and every projection-sink batch silently discarded by Spring
+   Kafka's default `FallbackBatchErrorHandler` from the app's very first request. `mvn test` never
+   caught this because `AbstractIntegrationTest` explicitly disables Flyway for tests and uses
+   Hibernate `ddl-auto=update` instead (a deliberate, reasonable test-speed choice — but it means no
+   test in this repo has ever exercised the production migration path). Fixed by adding the
+   starter dependency.
+2. **The audit script itself had a false-positive bug.** `verify-correctness.py`'s original
+   k6-vs-database cross-check assumed every non-accepted outcome must have zero payment rows — but
+   a payment rejected because the charge is already `PAID` is *supposed* to produce exactly one row
+   flagged `is_double_settlement=true` (G2's entire point). The first live run "failed" the audit
+   purely from this wrong assumption in the checking code, not a defect in the system under test.
+   Fixed by adding a third outcome bucket that expects exactly one flagged row.
+
+Neither of these would have been caught without actually running the packaged application against
+real infrastructure and real load — a reminder that a green test suite bounds what's broken, it
+doesn't prove nothing is.
+
 ### Acceptance criteria for the re-benchmark
 
 1. Both systems benchmarked through the same adapter protocol, same seed, same script, same

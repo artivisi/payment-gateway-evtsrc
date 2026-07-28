@@ -197,20 +197,67 @@ BUILD SUCCESS (21.545 s)
 
 ---
 
-## 8. Re-benchmark Required
+## 8. Re-benchmark: evtsrc (measured) — RDBMS side pending
 
-The previous version of this section ("Architectural Comparison & Analysis") has been deleted. Per `docs/benchmark-remediation-guideline.md` finding F7, its head-to-head table was not traceable to any k6 run and internally contradicted the measured runs in §3–4 of this same file: request counts identical to another run to the digit (86,581), a min/max/p95 collage of values pulled from different runs (including a µs/s unit swap on the quoted "p95"), and seed-data VA counts (19 in §2, 23 in the deleted §8.1) that disagreed with each other and with the script's actual seed. None of that table's numbers came from a committed k6 artifact.
+The previous version of this section ("Architectural Comparison & Analysis") was deleted. Per `docs/benchmark-remediation-guideline.md` finding F7, its head-to-head table was not traceable to any k6 run and internally contradicted the measured runs in §3–4 of this same file: request counts identical to another run to the digit (86,581), a min/max/p95 collage of values pulled from different runs (including a µs/s unit swap on the quoted "p95"), and seed-data VA counts (19 in §2, 23 in the deleted §8.1) that disagreed with each other and with the script's actual seed. None of that table's numbers came from a committed k6 artifact.
 
-**No comparative benchmark numbers currently exist for this system pair.** Sections 1–7 above measured a workload (`scenarios/suite.js`, generic `/api/v1/payments`, no pre-validation, no checksum, caller-supplied `chargeId`) that this remediation found exercised none of the gateway's real validation logic — not the RDBMS baseline's production code path, and not comparable to it. They are retained as historical record only (see the warning at the top of this file) and are not a substitute for a re-run.
+Sections 1–7 above measured a workload (`scenarios/suite.js`, generic `/api/v1/payments`, no pre-validation, no checksum, caller-supplied `chargeId`) that this remediation found exercised none of the gateway's real validation logic. `scenarios/suite.js` now throws immediately rather than run, so it cannot be used by mistake.
 
-A legitimate re-benchmark must:
+### 8.1 What this section reports
 
-1. Run `scenarios/suite-bsi.js` against this repo's real `/api/bank/bsi` adapter, and `scenarios/suite-rdbms.js` against the sibling `payment-gateway` repo's `/api/bank/bsi` adapter — the same protocol, same checksum scheme, same 6 BSI VA/amount pairs from `scenarios/seed-data.json`, same `ramping-arrival-rate` profile, on both sides. `scenarios/suite.js` itself now throws immediately rather than run, so it cannot be used by mistake.
-2. Set `RUN_ID` and `BSI_SHARED_SECRET` (no defaults — both scripts fail loud in the k6 init stage if either is missing) and use `scenarios/run-benchmark.sh` (or the equivalent direct `k6 run` invocation documented in the header comment of `scenarios/suite-bsi.js`) so `--summary-export` and `--out json` are always captured.
-3. Commit the resulting summary and raw JSON files under `scenarios/results/` per the naming contract in `scenarios/results/README.md`, run at least one discarded warm-up plus N≥2 measured runs per system, and derive every table in a future version of this report from those committed files — never hand-typed or averaged across runs into one column.
-4. Run `scenarios/verify-correctness.py` against the k6 raw output and both systems' state (Postgres, and for evtsrc also the RocksDB-backed `GET /api/v1/charges/{id}` endpoint) after projection lag reaches zero, and report its pass/fail result rather than assuming zero double settlements.
-5. Report accepted-payment TPS and reject/duplicate TPS separately (classified from the in-body `responseCode`, not HTTP status — the BSI protocol returns `200` for business rejections too), with knee/saturation analysis derived from the exported time series.
+The evtsrc side has been re-run against the corrected implementation (real RocksDB pre-validation, authoritative topology re-check, double-settlement detection, real BSI checksum) with committed artifacts. **The RDBMS baseline side has not been re-run** — the sibling `payment-gateway` app's BSI escrow has no usable shared secret configured (its `client_secret` column is `NULL`, encrypted-at-rest via AES-256-GCM; setting a real one requires either admin credentials on the running instance or completing a fresh instance's bootstrap+TOTP enrollment flow, neither of which is something to script around unattended). This is a **single-system measurement, not a comparison** — the head-to-head table this guideline calls for is still open pending that decision. See `docs/benchmark-remediation-guideline.md`'s verification notes for the exact blocker.
 
-No new numbers are invented or estimated here. This section will be replaced with a real comparison table once that re-run has been executed and its artifacts committed.
+### 8.2 Run conditions
+
+| | |
+|---|---|
+| **Date** | 2026-07-28 |
+| **Run ID** | `20260728133645` |
+| **Target** | evtsrc app, freshly built jar, fresh Postgres 18 + Kafka (KRaft, 6 partitions) containers, `localhost:8081` |
+| **Hardware** | Apple M5, 10-core, 16GB — **shared**, not dedicated: a separate project's own test suite (Oracle Testcontainers) and this machine's long-running RDBMS `payment-gateway` instance were both active on the same host during this run. Numbers below are if anything a conservative lower bound on dedicated hardware. |
+| **Script** | `scenarios/suite-bsi.js` against the real `/api/bank/bsi` adapter, real SHA-1 checksum, `RUN_ID`/`BSI_SHARED_SECRET` set (no defaults) |
+| **Artifacts** | `scenarios/results/2026-07-28-evtsrc-summary.json`, `scenarios/results/2026-07-28-evtsrc-raw.json.gz` (gzipped from k6's 342MB `--out json` for a committable size) |
+
+Two bugs were found and fixed while producing this run (both now in the codebase, not just this report):
+
+- **Flyway never ran.** Spring Boot 4 split autoconfiguration into per-module starters; `pom.xml` had bare `flyway-core`/`flyway-database-postgresql` but not `org.springframework.boot:spring-boot-flyway`, so Flyway silently migrated nothing — no tables, no error, no log line. Every projection-sink write was failing and being discarded by Spring Kafka's default batch error handler. This was invisible to `mvn test` because tests bypass Flyway entirely (`AbstractIntegrationTest` uses Hibernate `ddl-auto=update` for schema in tests) — it only surfaces when the packaged app is actually run against a real Postgres instance, which no prior step in this remediation had done. Fixed by adding the `spring-boot-flyway` starter.
+- **The audit script's own classification bug.** `scenarios/verify-correctness.py` originally expected every non-`ACCEPTED` k6 outcome to have zero payment rows — but a payment rejected because the charge is already `PAID` is *supposed* to produce exactly one row flagged `is_double_settlement=true` (that is the entire point of G2: never silently absorb an overpayment). The first run against the fixed app "failed" the audit purely because of this false assumption. Fixed by adding a third classification bucket (`is_double_settlement_outcome`) that expects exactly one flagged row instead of zero.
+
+### 8.3 Measured results (evtsrc, BSI protocol, real checksum)
+
+| Metric | Value |
+|---|---|
+| **Total requests** | 86,614 |
+| **HTTP error rate** | 0.00% |
+| **Dropped iterations** | 23 (out of 86,625 scheduled) |
+| **Effective throughput** | 960.4 req/s (ramp-averaged; peak target was 2,000 TPS) |
+| **Min latency** | 367 µs |
+| **Avg / median latency** | 4.26 ms / 3.94 ms |
+| **p90 / p95 / p99** | 6.51 ms / 7.22 ms / **15.38 ms** |
+| **Max latency** | 68.43 ms |
+| **Peak VUs actually used** | 83 (of 101 pre-allocated, 2,000 cap) |
+| **Threshold `p(99)<500ms`** | ✅ PASS (15.38ms) |
+| **Threshold `http_req_failed rate<0.01`** | ✅ PASS (0.00%) |
+
+The system never came close to needing its allotted VU capacity — every stage of the ramp (50→500→1,000→2,000 TPS target) was absorbed with single-digit-to-low-double-digit millisecond p99, a marked contrast to the pre-remediation runs in §3–4 (p50 in the hundreds of ms to seconds), because those runs measured an implementation that did no real validation work and had a single Kafka partition; this run has 6 partitions, a batched projection sink, and the full validation/topology path actually executing per request.
+
+### 8.4 Financial correctness audit (`scenarios/verify-correctness.py`, corrected)
+
+| Check | Result |
+|---|---|
+| **k6 outcome log vs `payment_projection` rows** | ✅ PASS — 209 accepted payments each have exactly one row; 86,393 payments correctly rejected as double-settlement (the charge they targeted was already `PAID`) each have exactly one row flagged `is_double_settlement=true`; every other rejection has zero rows. Zero disagreements. |
+| **RocksDB (`GET /api/v1/charges/{id}`) vs Postgres projection** | ✅ PASS — `cumulativePaid`/status agree for all 6 charges touched by this run. Zero disagreements. |
+| **Sink-arithmetic self-consistency (secondary, informational)** | Fails by design for any charge that accumulated double-settlement rows — this check naively sums *all* payment rows including flagged overpayment attempts against the original charge amount, which will never match once double-settlements exist. It is explicitly demoted and does not gate the audit's exit code (see `docs/benchmark-remediation-guideline.md` F3); the two checks above are the ones that matter and both pass. |
+
+209 accepted payments against 6 seeded VAs, with the rest of the traffic hitting already-settled charges, is expected given the workload design: 4 of the 6 seed VAs are CLOSED-type charges that settle after one payment and reject everything after (§5.4 of `scenarios/suite-bsi.js`'s header comment documents this; a future run could weight VA selection toward the two OPEN/INSTALLMENT VAs, or seed more CLOSED charges, to keep a larger fraction of traffic in the accepted state for the whole ramp).
+
+### 8.5 What is still required for a legitimate comparison
+
+1. A real (non-`NULL`) BSI shared secret configured on the RDBMS baseline (`payment-gateway`), through its own admin flow or a fresh bootstrapped instance — not scripted by an agent without the operator's credentials.
+2. `scenarios/suite-rdbms.js` run against that instance with the same `RUN_ID` and secret, producing its own committed summary/raw artifacts.
+3. `scenarios/verify-correctness.py` run against the RDBMS side's results.
+4. At least one more measured run per system (N≥2), per the guideline's G6 acceptance criteria — this section reports a single run.
+
+No numbers are invented for the RDBMS side above; §3–7's pre-remediation numbers remain the only historical reference until that comparison run happens.
 
 

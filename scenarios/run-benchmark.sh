@@ -65,3 +65,10 @@ k6 run \
     --summary-export="$SUMMARY_FILE" \
     --out "json=$RAW_FILE" \
     "$SCRIPT_DIR/suite-bsi.js"
+
+# k6's --out json emits every metric point (http_req_duration, iteration_duration, etc.), not just
+# payment_outcomes -- a full 90s ramp run is several hundred MB uncompressed. Gzip before leaving
+# it for a human to commit; verify-correctness.py's --k6-results expects the uncompressed path, so
+# gunzip -k it back out before auditing.
+gzip -f9 "$RAW_FILE"
+echo "Raw output gzipped: $RAW_FILE.gz ($(du -h "$RAW_FILE.gz" | cut -f1))"

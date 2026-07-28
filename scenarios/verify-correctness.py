@@ -222,6 +222,22 @@ def is_accepted_outcome(outcome):
     return outcome.startswith("ACCEPTED")
 
 
+def is_double_settlement_outcome(outcome):
+    """
+    A payment rejected because the charge was already PAID is NOT a payment the system silently
+    drops -- per docs/benchmark-remediation-guideline.md G1/G2, PaymentApplicationService and
+    PaymentGatewayStreamsTopology both emit a DoubleSettlementDetectedEvent for this case instead
+    of absorbing the overpayment, and PostgresProjectionSink projects it as exactly one
+    payment_projection row with is_double_settlement=true. The BSI wire protocol maps this (and
+    the still-unimplemented per-charge-type amount check) to responseCode "13", which
+    classifyOutcome() labels REJECTED_CHARGE_CLOSED_OR_INVALID_AMOUNT. Treating this bucket as
+    "must have zero rows" (as an earlier version of this check did) is a false positive: it is a
+    rejection from the caller's point of view AND a correctly-flagged row from the ledger's point
+    of view, simultaneously -- that is the whole point of "never silently absorbed".
+    """
+    return outcome == "REJECTED_CHARGE_CLOSED_OR_INVALID_AMOUNT"
+
+
 def fetch_run_payment_rows(cfg, run_id):
     """
     Returns {bank_reference: [row, ...]} for every payment-table row whose bank_reference starts
@@ -247,6 +263,7 @@ def fetch_run_payment_rows(cfg, run_id):
 def cross_check_k6_vs_db(ground_truth, db_rows):
     disagreements = []
     accepted_per_k6 = 0
+    double_settlement_per_k6 = 0
     rejected_per_k6 = 0
     recorded_in_db = 0
 
@@ -267,6 +284,20 @@ def cross_check_k6_vs_db(ground_truth, db_rows):
                     "actualRows": len(rows),
                     "rows": rows,
                 })
+        elif is_double_settlement_outcome(outcome):
+            double_settlement_per_k6 += 1
+            if rows:
+                recorded_in_db += 1
+            flagged = [r for r in rows if r.get("is_double_settlement")]
+            if len(rows) != 1 or len(flagged) != 1:
+                disagreements.append({
+                    "bankReference": bank_reference,
+                    "k6Outcome": outcome,
+                    "httpStatus": info.get("httpStatus"),
+                    "expectedRows": "1 (is_double_settlement=true)",
+                    "actualRows": f"{len(rows)} ({len(flagged)} flagged)",
+                    "rows": rows,
+                })
         else:
             rejected_per_k6 += 1
             if len(rows) != 0:
@@ -279,10 +310,11 @@ def cross_check_k6_vs_db(ground_truth, db_rows):
                     "rows": rows,
                 })
 
-    return accepted_per_k6, rejected_per_k6, recorded_in_db, disagreements
+    return accepted_per_k6, double_settlement_per_k6, rejected_per_k6, recorded_in_db, disagreements
 
 
-def print_k6_vs_db_report(cfg, args, ground_truth, accepted_per_k6, rejected_per_k6, recorded_in_db, disagreements):
+def print_k6_vs_db_report(cfg, args, ground_truth, accepted_per_k6, double_settlement_per_k6,
+                          rejected_per_k6, recorded_in_db, disagreements):
     print("=" * 78)
     print(" PRIMARY CHECK 1: k6 outcome log (independent ground truth) vs recorded payment rows")
     print("=" * 78)
@@ -290,7 +322,8 @@ def print_k6_vs_db_report(cfg, args, ground_truth, accepted_per_k6, rejected_per
     print(f"Run ID filter                       : {args.run_id}")
     print(f"Ground-truth data points (this run) : {len(ground_truth)}")
     print(f"Accepted per k6                      : {accepted_per_k6}")
-    print(f"Rejected per k6 (HTTP/protocol layer): {rejected_per_k6}")
+    print(f"Double-settlement (rejected+flagged) : {double_settlement_per_k6}")
+    print(f"Rejected per k6 (no event at all)    : {rejected_per_k6}")
     print(f"Recorded (>=1 row) in {cfg['payment_table']:<20}: {recorded_in_db}")
     print("-" * 78)
     if disagreements:
@@ -308,8 +341,9 @@ def print_k6_vs_db_report(cfg, args, ground_truth, accepted_per_k6, rejected_per
         if len(disagreements) > 50:
             print(f"  ... and {len(disagreements) - 50} more")
     else:
-        print("No mismatches: every k6-accepted bankReference has exactly one row; "
-              "every k6-rejected bankReference has zero rows.")
+        print("No mismatches: every k6-accepted bankReference has exactly one row; every "
+              "k6-flagged double-settlement bankReference has exactly one is_double_settlement=true "
+              "row; every other k6-rejected bankReference has zero rows.")
     print()
 
 
@@ -524,8 +558,10 @@ def main():
     print()
 
     db_rows = fetch_run_payment_rows(cfg, args.run_id)
-    accepted_per_k6, rejected_per_k6, recorded_in_db, mismatches1 = cross_check_k6_vs_db(ground_truth, db_rows)
-    print_k6_vs_db_report(cfg, args, ground_truth, accepted_per_k6, rejected_per_k6, recorded_in_db, mismatches1)
+    accepted_per_k6, double_settlement_per_k6, rejected_per_k6, recorded_in_db, mismatches1 = \
+        cross_check_k6_vs_db(ground_truth, db_rows)
+    print_k6_vs_db_report(cfg, args, ground_truth, accepted_per_k6, double_settlement_per_k6,
+                          rejected_per_k6, recorded_in_db, mismatches1)
 
     charge_audit = fetch_charge_audit(cfg)
     mismatches2 = print_rocksdb_vs_postgres_report(cfg, args, db_rows, charge_audit)

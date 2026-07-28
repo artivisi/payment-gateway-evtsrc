@@ -79,6 +79,14 @@
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
+        <!-- Spring Boot 4 split autoconfiguration into per-tech modules: bare flyway-core on the
+             classpath does not trigger migration, silently (no error, no tables). This starter is
+             what actually wires FlywayAutoConfiguration; flyway-core/flyway-database-postgresql
+             below are the engine + dialect it drives. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-flyway</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-core</artifactId>
