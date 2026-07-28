@@ -325,14 +325,15 @@ flowchart TD
 
 ---
 
-### 3.5 Synchronous HTTP Protocol Adapters & Zero-Pending State Semantics
+### 3.5 Synchronous HTTP Protocol Adapters & Hot-Path Pre-Validation
 
-Indonesian banking protocols (such as Maybank SNAP, BSI, and CIMB standards) mandate **strict synchronous HTTP responses**. The gateway must never return an intermediate "pending" or "in-progress" state to the bank:
+Indonesian banking protocols (Maybank SNAP, BSI, CIMB) mandate **strict synchronous HTTP responses**. The gateway must never return an intermediate "pending" state to the bank. This section describes the pre-validation actually implemented in `PaymentApplicationService.processPayment` / `InquiryApplicationService.inquireAccount`, executed on the HTTP request thread as interactive queries against the Kafka Streams RocksDB state stores — not a design aspiration.
 
-1. **Account Inquiry (`POST /api/v1/inquiry`)**: Must respond synchronously with **`HTTP 200 OK` + Customer Name & Balance** or **`HTTP 404` + Error Code (`INVALID_VA`)**.
-2. **Payment Callback (`POST /api/v1/payments`)**: Must respond synchronously with **`HTTP 200 OK` (Payment Success)** or **`HTTP 400 / 422` (Payment Failed + Error Reason)**.
-
-`payment-gateway-evtsrc` meets these synchronous bank SLAs by executing **sub-millisecond pre-validation against local embedded RocksDB state stores ($<1\text{ms}$)** before appending to Kafka:
+1. **Account Inquiry** (`POST /api/v1/inquiry`, `/api/inquiry`, `/api/bank/maybank/v1.0/transfer-va/inquiry`): responds **`HTTP 200 OK`** with customer name and outstanding amount on a resolved VA, or **`HTTP 404`** (`INVALID_VA` / `INVALID_CHARGE`) on an unresolved one.
+2. **Payment Callback** (`POST /api/v1/payments`, `/api/payments`, `/api/bank/maybank/v1.0/transfer-va/payment`; BSI's proprietary shape is served separately at `/api/bank/bsi`, see below): the outcome vocabulary is the `PaymentOutcome` enum (`ACCEPTED`, `DUPLICATE`, `REJECTED_INVALID_VA`, `REJECTED_CHARGE_CLOSED`, `REJECTED_INVALID_AMOUNT`, `REJECTED_INVALID_REQUEST`), mapped to HTTP status by `BankCallbackController`:
+   - `ACCEPTED`, `DUPLICATE` → `200 OK`
+   - `REJECTED_INVALID_VA` → `404 Not Found`
+   - `REJECTED_CHARGE_CLOSED`, `REJECTED_INVALID_AMOUNT`, `REJECTED_INVALID_REQUEST` → `400 Bad Request`
 
 ```mermaid
 flowchart TD
@@ -343,7 +344,7 @@ flowchart TD
 
     subgraph App_Instance ["Application Server (JVM Process)"]
         CTRL[Protocol Ingress Controller]
-        subgraph Local_RocksDB ["Off-Heap Local RocksDB (<1ms Lookups)"]
+        subgraph Local_RocksDB ["Local RocksDB, interactive query on the request thread"]
             VA_STORE[("va-registry-store")]
             CHG_STORE[("charge-state-store")]
             IDEM_STORE[("idempotency-store")]
@@ -359,42 +360,43 @@ flowchart TD
 
     %% INQUIRY FLOW
     INQ_REQ -->|"a. Sync HTTP POST"| CTRL
-    CTRL -->|"b. Lookup VA & Debt (<1ms)"| Local_RocksDB
-    CTRL -->|"c. Sync HTTP 200 OK (Customer Name + Total Amount)"| INQ_REQ
+    CTRL -->|"b. Lookup VA & charge"| Local_RocksDB
+    CTRL -->|"c1. Resolved -> HTTP 200 OK"| INQ_REQ
+    CTRL -->|"c2. Not found -> HTTP 404 INVALID_VA"| INQ_REQ
 
     %% PAYMENT FLOW
     PAY_REQ -->|"a. Sync HTTP POST"| CTRL
-    CTRL -->|"b. Pre-Validate Invariants & Idempotency (<1ms)"| Local_RocksDB
-    
-    CTRL -->|"c1. Validation Failed -> HTTP 400 Bad Request"| PAY_REQ
-    CTRL -->|"c2. Validation Passed -> Append Event (<1ms)"| PROD
+    CTRL -->|"b. Idempotency, VA, charge-status checks, in order"| Local_RocksDB
+
+    CTRL -->|"c1. Malformed request -> HTTP 400 REJECTED_INVALID_REQUEST"| PAY_REQ
+    CTRL -->|"c2. Duplicate bankReference -> HTTP 200 DUPLICATE"| PAY_REQ
+    CTRL -->|"c3. Unknown VA -> HTTP 404 REJECTED_INVALID_VA"| PAY_REQ
+    CTRL -->|"c4. Charge already PAID -> HTTP 400 REJECTED_CHARGE_CLOSED"| PAY_REQ
+    CTRL -->|"c5. Passed all checks -> Append PaymentReceivedEvent, block for the send ack"| PROD
     PROD --> KAFKA
-    CTRL -->|"c3. Sync HTTP 200 OK (Payment Success)"| PAY_REQ
+    CTRL -->|"c6. HTTP 200 ACCEPTED"| PAY_REQ
 
     %% ASYNC FANOUT
     KAFKA -.-> WEBHOOK
     KAFKA -.-> PG
 ```
 
-#### Detailed Execution Mechanics & State Isolation:
+#### Detailed Execution Mechanics:
 
-1. **Synchronous Account Inquiry Flow**:
-   - The bank sends `POST /api/v1/inquiry` with `bank_code` and `va_number`.
-   - The controller queries `va-registry-store` and `charge-state-store` directly in local RAM/SSD ($<1\text{ms}$).
-   - Returns **`HTTP 200 OK` containing customer name and remaining balance** without appending to Kafka or calling external databases.
+1. **Account Inquiry**: the controller looks up `bankCode_vaNumber` in `va-registry-store`, then the resolved `chargeId` in `charge-state-store`, and returns `200 OK` with the current outstanding amount, or `404` if either lookup misses.
 
-2. **Synchronous Payment Callback Validation & Execution**:
-   - The bank sends `POST /api/v1/payments` (`bank_code`, `va_number`, `bank_reference`, `amount`).
-   - **Hot-Path Pre-Validation ($<1\text{ms}$)**:
-     - **Idempotency Check**: Look up `bank_reference` in `idempotency-store`. If duplicate, return **`HTTP 200 OK` (Duplicate ACK)**.
-     - **VA & Invariant Check**: Look up `va_number` in `va-registry-store` and `charge-state-store`. If charge is already fully paid or amount is invalid, return **`HTTP 400 Bad Request` (`CHARGE_ALREADY_CLOSED` / `INVALID_AMOUNT`)**.
-   - **Kafka Append & Immediate Success ACK**:
-     - If validation passes, the controller appends `PaymentReceivedEvent` to Kafka topic `payment-events` ($\sim <1\text{ms}$).
-     - The controller returns **`HTTP 200 OK` (Payment Success)** synchronously to the bank.
+2. **Payment Callback Pre-Validation** (`PaymentApplicationService.processPayment`, in this exact order — each step short-circuits the rest):
+   1. **Field validation**: `bankCode`, `vaNumber`, `bankReference` non-blank, `amount` present and `> 0`, `paymentTimestamp` present. Any violation → `REJECTED_INVALID_REQUEST` (`400`). No field is defaulted or substituted — a missing `paymentTimestamp` is rejected, never set to `now()`.
+   2. **Idempotency**: look up `bankCode + "_" + bankReference` in `idempotency-store`. A hit returns `DUPLICATE` (`200`) with the originally recorded `eventId`/`chargeId` — no second event is appended.
+   3. **VA resolution**: look up `bankCode + "_" + vaNumber` in `va-registry-store`. A miss returns `REJECTED_INVALID_VA` (`404`). The caller does not supply `chargeId` — the gateway resolves it from the VA.
+   4. **Charge terminal-status check**: load the resolved charge from `charge-state-store`. If its status is `PAID`, the payment is rejected as `REJECTED_CHARGE_CLOSED` (`400`) **and** a `DoubleSettlementDetectedEvent` is appended to `payment-events` immediately, flagging the attempted overpayment rather than silently dropping it.
+   5. Otherwise, a `PaymentReceivedEvent` is appended to `payment-events` via `kafkaTemplate.send(...).get()` (the request blocks for the broker ack) and `ACCEPTED` (`200`) is returned.
 
-3. **Asynchronous Merchant Notification & Read Projections**:
-   - After the bank receives its synchronous `200 OK`, `WebhookDispatcherWorker` streams events from Kafka to deliver signed HTTP POST webhooks to client systems (subledgers like `account-receivable`).
-   - `PostgresProjectionSink` asynchronously upserts read models into PostgreSQL 18 for Web UI dashboard reporting.
+   **Not implemented**: `REJECTED_INVALID_AMOUNT` is declared in the outcome enum and already wired to `400` in both callback controllers, but no code path currently produces it. Per-charge-type amount validation (CLOSED payment must equal the remaining balance; INSTALLMENT must not exceed it) described as a target in earlier design notes does not exist yet — the only amount check on the request thread is the `> 0` field check above.
+
+3. **Residual race, and where it's actually closed**: this pre-validation runs on the request thread and is **not** the authoritative serialization point — two concurrent callbacks against the same charge can both pass step 4 before either `PaymentReceivedEvent` is applied. `PaymentEventProcessor` in `PaymentGatewayStreamsTopology` (the single writer per `chargeId` partition key) re-checks idempotency and the charge's terminal status before applying `cumulativePaid`, and emits its own `DoubleSettlementDetectedEvent` instead of applying an overpayment if that race actually occurred. A concurrent-settlement test (`BankCallbackControllerIntegrationTest.testPaymentCallback_ConcurrentFullSettlement_ExactlyOneApplied`) exercises this end to end.
+
+4. **Asynchronous fan-out**: after the bank receives its synchronous response, `WebhookDispatcherWorker` and `PostgresProjectionSink` consume `payment-events` (and the other domain topics) independently to deliver client webhooks and update the PostgreSQL read model. Neither is on the request path.
 
 #### 3.5.1 Internal Uniform Correlation ID vs. External Bank Correlation ID Mapping
 
@@ -482,7 +484,7 @@ When deploying `payment-gateway-evtsrc` into an existing enterprise environment 
 #### 2. Event-Sourced CQRS Approach Limitations (`payment-gateway-evtsrc`)
 - **Partition Count Bounded Parallelism**: Processing parallelism in Kafka Streams is strictly bounded by the number of partitions per Kafka topic. Increasing parallelism beyond the initial partition count requires a topic re-partitioning migration and state re-hydration.
 - **Storage Footprint Amplification**: Events are stored across three storage tiers: (1) immutable Kafka topic segment files, (2) embedded local RocksDB SSTable files on app instances, and (3) relational projection tables in PostgreSQL 18.
-- **Eventual Consistency & Projection Lag**: There is an inherent projection lag ($\sim 10\text{--}100\text{ ms}$) between Kafka event emission and PostgreSQL table update. Client applications and Web UI operators must account for eventual consistency rather than immediate ACID read-after-write.
+- **Eventual Consistency & Projection Lag**: there is an inherent lag between Kafka event emission and PostgreSQL table update. `PostgresProjectionSink` exposes it live at `GET /api/admin/debug/projection-lag` (`{"lagMillis": null}` until the first payment is projected); no lag figure has been measured under load with the current batch-listener sink, so no number is quoted here — read the endpoint during any real benchmark run instead of assuming a value.
 - **Off-Heap C++ Native Memory Management**: RocksDB operates outside the JVM heap. Improper memory configuration (block cache, memtable bounds) can cause Linux OS OOM-killer to terminate application containers unexpectedly under heavy write pressure.
 
 ---
@@ -515,6 +517,10 @@ Key constraints:
 | **High-Scale Enterprise** | $5,000\text{--}10,000+\text{ TPS}$ | 6 App Instances (4 threads/node = 24 threads) | **24 Partitions** | Maximum parallel processing across multi-AZ container clusters. |
 
 > **Why 12 Partitions is the Default Production Baseline**: In Kafka Streams, increasing topic partitions after initial deployment requires topic re-partitioning and re-hydrating RocksDB state stores. Selecting **12 partitions** upfront allows scaling from 1 to 12 instances smoothly without re-partitioning topics.
+
+#### 4. Current Implementation Status
+
+Topics are created explicitly by `KafkaTopicConfig` (`NewTopic` beans for `charge-events`, `va-events`, `payment-events`, `reconciliation-events`, `webhook-events`), not left to Kafka's auto-creation default of 1 partition. Partition count is the single property `app.kafka.partitions` (default **6**, matching the Starter tier above), `replicationFactor` **1**. `spring.kafka.listener.concurrency` for the projection sink's batch listener is driven by the same property. `spring.kafka.streams.num.stream.threads` is still hardcoded at **6** independently of `app.kafka.partitions` — raising the partition count without also raising this value under-utilizes the extra partitions. No throughput numbers below reflect a run against this partitioning; they are unmeasured until a benchmark is executed with it in place.
 
 ---
 
@@ -654,6 +660,8 @@ One of the key benefits of this Event Sourcing setup is the ability to wipe the 
 
 To quantitatively validate the architectural claims of `payment-gateway-evtsrc` against the relational `payment-gateway` baseline, both repositories are benchmarked using identical hardware allocations and load testing tools (**k6**).
 
+> **Prior to this remediation, workload not comparable to the current suite.** All measured figures in §5.2–§5.3 below were captured against the retired `scenarios/suite.js`, which hit a generic, unauthenticated `/api/v1/payments` endpoint with the caller supplying `chargeId` directly and no server-side pre-validation (see `docs/benchmark-remediation-guideline.md` findings F1/F5/F7). That code path no longer exists — the hot path now does real idempotency/VA/charge-status pre-validation against RocksDB (§3.5). The numbers below are kept as historical record only; they do not describe the current implementation and must not be read as current or valid. A fresh benchmark against the corrected workload (§5.4) has not yet been run.
+
 ### 5.1 Benchmark Environment & Hardware Under Test
 
 | Component | Specification |
@@ -671,18 +679,18 @@ To quantitatively validate the architectural claims of `payment-gateway-evtsrc` 
 
 > **Note**: All components (App JVM, Kafka broker, PostgreSQL) ran on the **same physical machine** sharing CPU and memory. Production deployments on dedicated infrastructure would yield significantly better results.
 
-- **Pre-populated Dataset**: 8 active charges with 19 sibling VAs across 6 banks (MAYBANK, BSI, CIMB, BCA, BNI, BRI) and 3 client institutions.
+- **Pre-populated Dataset** (`scenarios/seed-data.json`, counted directly from the file): 8 charges (5 `CLOSED`, 2 `OPEN`, 1 `INSTALLMENT`) with **23** sibling VAs across 6 banks (MAYBANK, BSI, CIMB, BCA, BNI, BRI) and 3 client institutions (`CLIENT-UNIVERSITAS-TAZKIA`, `CLIENT-RUMAH-SAKIT-ISLAM`, `CLIENT-FOUNDATION-PEDULI`). Of the 23 VAs, 6 are BSI — the set the current `scenarios/suite-bsi.js` workload (§5.4) drives.
 
 ---
 
 ### 5.2 Benchmark Test Scenarios
 
-#### Scenario A: High-Concurrency Bank Callbacks (Tuition Deadline Peak) ✅ Executed
+#### Scenario A: High-Concurrency Bank Callbacks (Tuition Deadline Peak) — ⚠️ Executed prior to this remediation, not comparable to the current suite
 - **Goal**: Measure maximum callback throughput (TPS), response latency ($p_{95}, p_{99}$), and financial correctness during peak payment bursts.
-- **Workload**: `POST /api/v1/payments` (simulated multi-bank callbacks across 6 banks) using `ramping-arrival-rate` executor ramping from 100 → 500 → 1,000 → 2,000 TPS over 90 seconds with up to 2,000 concurrent VUs.
-- **Measured Result** (see §5.3 for full metrics):
-  - `payment-gateway-evtsrc`: **0.00% error rate** across 113,594 total requests. Min latency **875 µs**. Sustained ~750 TPS with sub-10ms p99 (linear zone). Peak throughput ~2,000 TPS (VU-limited). **Zero double settlements**, all financial invariants verified.
-  - `payment-gateway` (RDBMS): *Not yet benchmarked* — to be tested under identical k6 suite for direct comparison.
+- **Workload (historical)**: `POST /api/v1/payments` against the now-retired generic endpoint (simulated multi-bank callbacks across 6 banks, caller-supplied `chargeId`, no pre-validation) using `ramping-arrival-rate` executor ramping from 100 → 500 → 1,000 → 2,000 TPS over 90 seconds with up to 2,000 concurrent VUs. The current workload is `scenarios/suite-bsi.js` against `/api/bank/bsi` (§5.4).
+- **Measured Result, historical** (see §5.3 for full metrics; kept for record, not current):
+  - `payment-gateway-evtsrc`: **0.00% error rate** across 113,594 total requests. Min latency **875 µs**. Sustained ~750 TPS with sub-10ms p99 (linear zone). Peak throughput ~2,000 TPS (VU-limited). **Zero double settlements** — but this run predates any double-settlement detection code (see `docs/benchmark-remediation-guideline.md` F2): the figure reflects an absent check, not a verified invariant.
+  - `payment-gateway` (RDBMS): *Not yet benchmarked under the current suite* — to be tested with `scenarios/suite-bsi.js` for direct comparison.
 
 #### Scenario B: Concurrent EOD Reconciliation Import + Live Callback Traffic
 - **Goal**: Evaluate write isolation when heavy batch processing runs concurrently with live bank callbacks.
@@ -719,9 +727,9 @@ To quantitatively validate the architectural claims of `payment-gateway-evtsrc` 
 
 ---
 
-### 5.3 Measured Benchmark Performance Matrix
+### 5.3 Measured Benchmark Performance Matrix — historical, prior to this remediation, not comparable to a future re-run
 
-> **Benchmark Date**: 2026-07-26. Two consecutive k6 runs on shared single-node hardware (Apple M5, 10-core, 16GB). Full report: [`perf_benchmark_report.md`](scenarios/perf_benchmark_report.md).
+> **Benchmark Date**: 2026-07-26. Two consecutive k6 runs on shared single-node hardware (Apple M5, 10-core, 16GB), against the retired generic `/api/v1/payments` endpoint described in §5.2. Full report: [`perf_benchmark_report.md`](scenarios/perf_benchmark_report.md) (its own §8 head-to-head table has been removed as untraceable — see that file's "Re-benchmark Required" section). No re-benchmark against the current hot path (§3.5) or the current BSI-protocol suite (§5.4) has been run yet; do not treat the figures below as current.
 
 #### Measured Metrics (Event-Sourced CQRS — `payment-gateway-evtsrc`)
 
@@ -772,21 +780,32 @@ To quantitatively validate the architectural claims of `payment-gateway-evtsrc` 
 
 ---
 
-### 5.4 Unified k6 Test Suite Reusability
+### 5.4 Shared BSI-Protocol k6 Workload
 
-Because both `payment-gateway-evtsrc` and the relational `payment-gateway` implement **100% identical external REST API contracts** (request JSON payloads, SNAP/REST bank callback endpoints, HTTP status codes), **a single k6 test suite is reused without modification** to benchmark both architectures head-to-head.
+The two repositories do **not** share a generic endpoint — `payment-gateway-evtsrc`'s earlier `scenarios/suite.js` hit a synthetic `/api/v1/payments` shape with no counterpart benchmarked seriously on the RDBMS side, and it exercised no real validation (`docs/benchmark-remediation-guideline.md`, findings F1/F5/F7). `scenarios/suite.js` now throws immediately on execution, pointing here instead of silently running that workload.
+
+The comparable workload is the **real BSI proprietary adapter**, implemented on both sides at `POST /api/bank/bsi` with identical checksum (`SHA1(nomorPembayaran + secret + tanggalTransaksi)`) and response-code semantics:
+
+- `payment-gateway-evtsrc`: `scenarios/suite-bsi.js` — the canonical script, targeting this repo's `BsiAdapterController` on its own port.
+- `payment-gateway` (RDBMS): `scenarios/suite-rdbms.js`, kept in this repo's `scenarios/` as a read-only reference copy of the sibling repo's real BSI-adapter script (the sibling `payment-gateway` repo has no k6 scripts of its own today) — run it with `TARGET_URL` pointed at the RDBMS gateway's port instead.
+
+Both scripts drive the same 6 BSI VA/amount pairs from `scenarios/seed-data.json`, the same `ramping-arrival-rate` profile (`startRate: 50`), and both require `RUN_ID` and `BSI_SHARED_SECRET` as environment variables with no default — a missing value throws in the k6 init stage rather than silently falling back to an empty/`"null"` secret (the exact bug that made the old checksum trivially forgeable). `RUN_ID` prefixes every generated `idTransaksi`/`bankReference` so one run's payments can be isolated from an accumulating audit table, and every payment POST is classified into the `payment_outcomes` k6 metric from the in-body `responseCode`, not HTTP status.
 
 ```bash
-# 1. Run Scenario A (Bank Callback Ingress Peak) against RDBMS Gateway
-k6 run -e TARGET_URL=http://localhost:8080 -e SCENARIO=callback_peak scenarios/suite.js
+# evtsrc gateway — wraps the exact k6 invocation and writes traceable artifacts
+export RUN_ID=$(date +%Y%m%d%H%M%S)
+export BSI_SHARED_SECRET=<value matching app.bank-secrets.secrets.bsi on the running app>
+./scenarios/run-benchmark.sh http://localhost:8080
 
-# 2. Run Scenario A against Event-Sourced CQRS Gateway
-k6 run -e TARGET_URL=http://localhost:8081 -e SCENARIO=callback_peak scenarios/suite.js
-
-# 3. Run Scenario D (Postgres Container Outage Resilience Test)
-docker stop postgres-db-container
-k6 run -e TARGET_URL=http://localhost:8081 -e SCENARIO=db_outage scenarios/suite.js
+# RDBMS gateway — same RUN_ID and BSI_SHARED_SECRET, same escrow secret configured on that app
+RUN_ID=$RUN_ID BSI_SHARED_SECRET=$BSI_SHARED_SECRET k6 run \
+  -e TARGET_URL=http://localhost:8082 \
+  --summary-export=scenarios/results/$(date +%Y-%m-%d)-rdbms-summary.json \
+  --out json=scenarios/results/$(date +%Y-%m-%d)-rdbms-raw.json \
+  scenarios/suite-rdbms.js
 ```
+
+Raw and summary JSON from every run belong under `scenarios/results/` (see `scenarios/results/README.md` for the artifact-naming contract) — no number is reported in `perf_benchmark_report.md` without a committed file behind it. As of this writing, no full-ramp run of this shared suite has been executed against either system (a syntax/init check and a small manual smoke test were run during development, not a measured benchmark) — §5.2/§5.3 above remain the only numbers on record, and they predate this suite. `scenarios/suite-rdbms.js` also still needs the RDBMS gateway configured with a real, non-`NULL` escrow secret before a legitimate comparison run — see `docs/benchmark-remediation-guideline.md` F5.
 
 ---
 

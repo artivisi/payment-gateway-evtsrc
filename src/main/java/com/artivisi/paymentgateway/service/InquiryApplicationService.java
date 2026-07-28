@@ -43,33 +43,41 @@ public class InquiryApplicationService {
             String message
     ) {}
 
+    /**
+     * Controller-facing overload. Delegates to the primitive-argument method so future
+     * non-generic adapters (e.g. a dedicated BSI controller) can call this service without
+     * depending on InquiryController's inner request type.
+     */
     public InquiryResult inquireAccount(InquiryController.AccountInquiryRequest request) {
-        String bankCode = request.bankCode() != null ? request.bankCode() : "GENERIC_BANK";
-        String vaNumber = request.vaNumber();
+        return inquireAccount(request.bankCode(), request.vaNumber());
+    }
+
+    public InquiryResult inquireAccount(String bankCode, String vaNumber) {
+        String effectiveBankCode = bankCode != null ? bankCode : "GENERIC_BANK";
 
         if (streamsBuilderFactoryBean == null) {
             log.warn("Kafka Streams builder not initialized; inquiry returning unavailable");
-            return new InquiryResult("ERROR", bankCode, vaNumber, null, null, "Streaming engine unavailable");
+            return new InquiryResult("ERROR", effectiveBankCode, vaNumber, null, null, "Streaming engine unavailable");
         }
 
         try {
             KafkaStreams kafkaStreams = streamsBuilderFactoryBean.getKafkaStreams();
             if (kafkaStreams == null || kafkaStreams.state() != KafkaStreams.State.RUNNING) {
-                return new InquiryResult("ERROR", bankCode, vaNumber, null, null, "Streams state store re-balancing");
+                return new InquiryResult("ERROR", effectiveBankCode, vaNumber, null, null, "Streams state store re-balancing");
             }
 
             // 1. Query va-registry-store in local off-heap RocksDB (<1ms)
             ReadOnlyKeyValueStore<String, String> vaStore = kafkaStreams.store(
                     StoreQueryParameters.fromNameAndType(StoreConstants.VA_REGISTRY_STORE, QueryableStoreTypes.keyValueStore())
             );
-            String lookupKey = bankCode + "_" + vaNumber;
+            String lookupKey = effectiveBankCode + "_" + vaNumber;
             String chargeId = vaStore.get(lookupKey);
             if (chargeId == null && vaNumber != null) {
                 chargeId = vaStore.get(vaNumber);
             }
 
             if (chargeId == null) {
-                return new InquiryResult("INVALID_VA", bankCode, vaNumber, null, null, "Virtual account not found");
+                return new InquiryResult("INVALID_VA", effectiveBankCode, vaNumber, null, null, "Virtual account not found");
             }
 
             // 2. Query charge-state-store in local off-heap RocksDB (<1ms)
@@ -78,7 +86,7 @@ public class InquiryApplicationService {
             );
             String chargeJson = chargeStore.get(chargeId);
             if (chargeJson == null) {
-                return new InquiryResult("INVALID_CHARGE", bankCode, vaNumber, null, null, "Charge record not found for VA");
+                return new InquiryResult("INVALID_CHARGE", effectiveBankCode, vaNumber, null, null, "Charge record not found for VA");
             }
 
             JsonNode node = objectMapper.readTree(chargeJson);
@@ -86,13 +94,13 @@ public class InquiryApplicationService {
             BigDecimal totalAmount = node.hasNonNull("totalAmount") ? new BigDecimal(node.get("totalAmount").asString()) : BigDecimal.ZERO;
 
             log.info("Account inquiry resolved in RocksDB for bankCode: {}, vaNumber: {}, chargeId: {}",
-                    bankCode, vaNumber, chargeId);
+                    effectiveBankCode, vaNumber, chargeId);
 
-            return new InquiryResult("SUCCESS", bankCode, vaNumber, customerName, totalAmount, "Account inquiry successful");
+            return new InquiryResult("SUCCESS", effectiveBankCode, vaNumber, customerName, totalAmount, "Account inquiry successful");
 
         } catch (Exception e) {
             log.error("Account inquiry failed in RocksDB for vaNumber: {}", vaNumber, e);
-            return new InquiryResult("ERROR", bankCode, vaNumber, null, null, "Inquiry processing error: " + e.getMessage());
+            return new InquiryResult("ERROR", effectiveBankCode, vaNumber, null, null, "Inquiry processing error: " + e.getMessage());
         }
     }
 }

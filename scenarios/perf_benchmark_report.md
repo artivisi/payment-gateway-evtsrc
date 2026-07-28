@@ -5,6 +5,9 @@
 **Test Tool**: k6 v0.55+ (Grafana Labs)
 **Test Script**: [`scenarios/suite.js`](file:///Users/endymuhardin/workspace/produk/payment-gateway-evtsrc/scenarios/suite.js)
 
+> [!WARNING]
+> **Sections 1–7 predate `docs/benchmark-remediation-guideline.md`'s remediation and are not comparable to a future re-run.** They were measured against `scenarios/suite.js` hitting a generic, unauthenticated `/api/v1/payments` endpoint with caller-supplied `chargeId` and no server-side pre-validation, idempotency check, or double-settlement detection (findings F1/F2/F5/F7). That script now throws immediately on execution rather than run. The numbers below are kept as historical record only — see "Re-benchmark Required" (§8) for what a valid re-run requires.
+
 ---
 
 ## 1. Hardware Under Test
@@ -194,65 +197,20 @@ BUILD SUCCESS (21.545 s)
 
 ---
 
-## 8. Architectural Comparison & Analysis: Relational Baseline (`payment-gateway`) vs. Event-Sourced CQRS (`payment-gateway-evtsrc`)
+## 8. Re-benchmark Required
 
-### 8.1 Comparative Performance Benchmark Matrix
+The previous version of this section ("Architectural Comparison & Analysis") has been deleted. Per `docs/benchmark-remediation-guideline.md` finding F7, its head-to-head table was not traceable to any k6 run and internally contradicted the measured runs in §3–4 of this same file: request counts identical to another run to the digit (86,581), a min/max/p95 collage of values pulled from different runs (including a µs/s unit swap on the quoted "p95"), and seed-data VA counts (19 in §2, 23 in the deleted §8.1) that disagreed with each other and with the script's actual seed. None of that table's numbers came from a committed k6 artifact.
 
-Both implementations were benchmarked under identical test conditions on the same physical hardware (Apple M5 10-core, 16GB RAM) using the exact same seed dataset (8 charges, 23 virtual accounts across 6 banks and 3 clients) and k6 ramping workload (50 → 500 → 1,000 → 2,000 TPS over 90 seconds):
+**No comparative benchmark numbers currently exist for this system pair.** Sections 1–7 above measured a workload (`scenarios/suite.js`, generic `/api/v1/payments`, no pre-validation, no checksum, caller-supplied `chargeId`) that this remediation found exercised none of the gateway's real validation logic — not the RDBMS baseline's production code path, and not comparable to it. They are retained as historical record only (see the warning at the top of this file) and are not a substitute for a re-run.
 
-| Performance & Scalability Metric | Relational Baseline (`payment-gateway` - RDBMS) | Event-Sourced CQRS (`payment-gateway-evtsrc` - CQRS) | Winner / Key Takeaway |
-| :--- | :--- | :--- | :--- |
-| **Total Test Requests Executed** | **86,581** | **86,581** | Identical test workload |
-| **HTTP Success Rate** | **100.00%** (86,581 / 86,581) | **100.00%** (86,581 / 86,581) | Tie (100% reliability) |
-| **HTTP Error Rate** | **0.00%** | **0.00%** | Tie (Zero failures under peak load) |
-| **Effective Avg Throughput** | **961.87 TPS** | **961.94 TPS** | Tie (identical sustained throughput) |
-| **Minimum Latency** | **256 µs** (0.25 ms) | **875 µs** (0.87 ms) | 🏆 **RDBMS Faster** (~3.4x lower min latency) |
-| **Median Latency (p50)** | **569 µs** (0.57 ms) | **682 µs** (0.68 ms) | 🏆 **RDBMS Slightly Faster** (~16% lower median) |
-| **p90 Latency** | **2.65 ms** | **2.91 ms** | 🏆 **RDBMS Slightly Faster** (~9% lower p90) |
-| **p95 Latency** | **3.75 ms** | **4.12 ms** | 🏆 **RDBMS Slightly Faster** (~9% lower p95) |
-| **p99 Latency** | **16.26 ms** | **18.45 ms** | 🏆 **RDBMS Slightly Faster** (~12% lower p99) |
-| **Max Tail Latency** | **175.67 ms** | **3.47 s** | 🏆 **RDBMS Lower Tail Latency** |
-| **Double Settlements** | **0** | **0** | Tie (Zero double-settlements) |
-| **Financial Invariant Audit** | **100% PASS** | **100% PASS** | Tie (Both pass all balance checks) |
+A legitimate re-benchmark must:
 
----
+1. Run `scenarios/suite-bsi.js` against this repo's real `/api/bank/bsi` adapter, and `scenarios/suite-rdbms.js` against the sibling `payment-gateway` repo's `/api/bank/bsi` adapter — the same protocol, same checksum scheme, same 6 BSI VA/amount pairs from `scenarios/seed-data.json`, same `ramping-arrival-rate` profile, on both sides. `scenarios/suite.js` itself now throws immediately rather than run, so it cannot be used by mistake.
+2. Set `RUN_ID` and `BSI_SHARED_SECRET` (no defaults — both scripts fail loud in the k6 init stage if either is missing) and use `scenarios/run-benchmark.sh` (or the equivalent direct `k6 run` invocation documented in the header comment of `scenarios/suite-bsi.js`) so `--summary-export` and `--out json` are always captured.
+3. Commit the resulting summary and raw JSON files under `scenarios/results/` per the naming contract in `scenarios/results/README.md`, run at least one discarded warm-up plus N≥2 measured runs per system, and derive every table in a future version of this report from those committed files — never hand-typed or averaged across runs into one column.
+4. Run `scenarios/verify-correctness.py` against the k6 raw output and both systems' state (Postgres, and for evtsrc also the RocksDB-backed `GET /api/v1/charges/{id}` endpoint) after projection lag reaches zero, and report its pass/fail result rather than assuming zero double settlements.
+5. Report accepted-payment TPS and reject/duplicate TPS separately (classified from the in-body `responseCode`, not HTTP status — the BSI protocol returns `200` for business rejections too), with knee/saturation analysis derived from the exported time series.
 
-### 8.2 Architectural Analysis: Why is the RDBMS Slightly Faster in Single-Node Latency?
-
-Yes, **the RDBMS implementation is slightly faster than the Event-Sourced CQRS variant in single-node latency** (p50 of **569 µs** vs. **682 µs**, and p99 of **16.26 ms** vs. **18.45 ms**). The technical reasons for this performance delta are:
-
-1. **Fewer Processing & Network Hops on the Hot Path**:
-   - **Relational (`payment-gateway`)**: The HTTP request thread executes an `@Transactional` Spring service method. It queries PostgreSQL over a local connection via `SELECT FOR UPDATE`, executes domain rules in memory, executes `UPDATE`/`INSERT` queries, commits the transaction, and returns HTTP 200. Total path: **1 synchronous DB round-trip**.
-   - **Event-Sourced (`payment-gateway-evtsrc`)**: The HTTP request thread serializes a `PaymentReceived` event and writes it to Apache Kafka (`payment-events`). The Kafka Streams topology processes the event asynchronously across an off-heap RocksDB state store (`charge-state-store`) and projects read-model rows into PostgreSQL. The extra serialization steps, network I/O to Kafka brokers, and Kafka Streams state store commit checkpoints introduce a small latency overhead (~100–200 µs on median response time).
-
-2. **Single-Node Low Lock Contention**:
-   - On a single-node deployment with moderate concurrency, PostgreSQL's write-ahead log (WAL) and row-level locking (`SELECT FOR UPDATE`) operate with minimal lock contention, delivering sub-millisecond responses directly from PostgreSQL's shared buffer pool.
-
----
-
-### 8.3 Architectural Trade-Off Summary
-
-| Architectural Dimension | Relational Database (`payment-gateway`) | Event-Sourced CQRS (`payment-gateway-evtsrc`) |
-| :--- | :--- | :--- |
-| **Single-Node Latency** | 🏆 **Slightly Faster** (256 µs min, 569 µs p50) due to fewer execution hops. | **Slightly Higher Latency** (875 µs min, 682 µs p50) due to Kafka event serialization. |
-| **Horizontal Scalability** | **Harder to Scale Writes** (requires DB partitioning, sharding, or complex multi-primary clusters). | 🏆 **Seamless Scale-Out** (partition Kafka topics & scale JVM workers linearly across nodes). |
-| **Auditability & Replayability** | **Current State Only** (past states overwritten by `UPDATE` queries unless audit log tables are manually maintained). | 🏆 **100% Immutable Event History** (can replay events to reconstruct state at any historical point in time). |
-| **Operational Complexity** | 🏆 **Low** (Single Java app + single PostgreSQL database). | **Medium-High** (Requires Kafka cluster, RocksDB state management, and CQRS projection sink). |
-| **Read/Write Decoupling** | **Coupled** (Heavy UI read queries can contend with hot-path payment transactions). | 🏆 **Fully Decoupled** (Hot-path bank callbacks touch RocksDB/Kafka; UI reads hit PostgreSQL asynchronously). |
-
----
-
-### 8.4 Dataset Design Considerations & Scale Dynamics
-
-#### 1. Why Test with a Concentrated Seed Dataset (8 Charges, 23 VAs)?
-The benchmark deliberately utilizes a compact dataset of 8 Charges and 23 Virtual Accounts receiving **86,581 incoming HTTP payment callbacks** ($\approx 3,764$ callbacks per VA):
-- **Intentional Row-Lock Contention Stress Test**: In `payment-gateway` (RDBMS), incoming bank callbacks execute `SELECT FOR UPDATE` pessimistic locks on the parent `charge` row to serialize concurrent sibling VA payments. Directing 86,581 requests across 8 charge rows creates **extreme row-level lock contention**, thoroughly testing PostgreSQL's lock manager and WAL writer under maximum burst pressure.
-- **High Volume & Open Deposit Handling**: Out of 86,581 incoming HTTP requests, **28,875 payments** hit `OPEN` charge types (unlimited deposit wallets) and were successfully accepted and recorded in the database (accumulating IDR 2.17 Billion). The remaining callbacks hitting `CLOSED` charges were validated via idempotent status checks once the charge reached `PAID`.
-
-#### 2. Scale Dynamics: Large Datasets (10,000+ to 100,000+ Charges)
-In a production environment with 100,000+ active charges:
-- **Lock Contention Drops to Zero**: Request traffic is distributed across 100,000 distinct database rows instead of queuing behind 8 charge rows.
-- **Indexed $O(\log N)$ Read Performance**: PostgreSQL's `B-Tree` indexes on `virtual_account(va_number)` and `charge(id)` maintain sub-millisecond lookup times ($\approx 3$ B-Tree page reads for $N = 1,000,000$).
-- **Event-Sourced RocksDB Partitioning**: In `payment-gateway-evtsrc`, embedded RocksDB off-heap key-value stores (`KTable`) perform $O(1)$ memory-mapped binary lookups regardless of key count, ensuring consistent sub-millisecond hot-path validation even when scaling to millions of active VAs across multiple Kafka partitions.
+No new numbers are invented or estimated here. This section will be replaced with a real comparison table once that re-run has been executed and its artifacts committed.
 
 

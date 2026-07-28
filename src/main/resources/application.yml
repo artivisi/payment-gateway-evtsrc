@@ -9,8 +9,6 @@ spring:
     driver-class-name: org.postgresql.Driver
 
   jpa:
-    hibernate:
-      ddl-auto: update
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
@@ -34,8 +32,13 @@ spring:
         state.dir: ${ROCKSDB_STATE_DIR:./target/rocksdb}
         num.stream.threads: 6
         num.standby.replicas: 0 # Starter 1-node footprint setup
+    listener:
+      type: batch
+      concurrency: ${app.kafka.partitions:6}
 
 app:
+  kafka:
+    partitions: ${APP_KAFKA_PARTITIONS:6} # Starter tier partition count per README §4.3; drives topic creation + listener/streams concurrency
   topics:
     charge-events: charge-events
     va-events: va-events
@@ -44,3 +47,8 @@ app:
     webhook-events: webhook-events
   migration:
     seed-from-postgres: ${APP_MIGRATION_SEED_FROM_POSTGRES:false}
+  bank-secrets:
+    secrets:
+      # BSI proprietary-checksum shared secret: SHA1(nomorPembayaran + secret + tanggalTransaksi).
+      # PLACEHOLDER ONLY -- override per environment via BANK_SECRET_BSI. Do not deploy this value.
+      bsi: ${BANK_SECRET_BSI:CHANGE_ME_BSI_SHARED_SECRET_NOT_FOR_PRODUCTION}

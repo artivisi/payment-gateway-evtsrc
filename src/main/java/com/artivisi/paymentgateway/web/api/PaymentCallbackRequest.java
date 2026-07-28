@@ -9,31 +9,30 @@ import java.math.BigDecimal;
 import java.time.Instant;
 
 /**
- * Universal Payment Callback Request supporting generic JSON payloads,
- * Maybank SNAP 1.0.2 payloads, and BSI REST payloads.
+ * Generic / Maybank-shaped payment callback request.
+ * The caller must NOT supply the charge id — the gateway resolves it from the
+ * (bankCode, vaNumber) pair via the va-registry-store. A dedicated BSI controller
+ * with its own DTO owns the BSI proprietary payload shape.
  */
 public record PaymentCallbackRequest(
-        @NotBlank(message = "chargeId is required")
-        @JsonAlias({"charge_id", "idTransaksi", "virtualAccountNo"})
-        String chargeId,
-
         @NotBlank(message = "bankCode is required")
         @JsonAlias({"bank_code", "kodeBank"})
         String bankCode,
 
         @NotBlank(message = "vaNumber is required")
-        @JsonAlias({"va_number", "nomorPembayaran", "virtualAccountNo"})
+        @JsonAlias({"va_number", "virtualAccountNo"})
         String vaNumber,
 
         @NotBlank(message = "bankReference is required")
-        @JsonAlias({"bank_reference", "idTransaksi", "referenceNo", "checksum"})
+        @JsonAlias({"bank_reference", "referenceNo"})
         String bankReference,
 
         @NotNull(message = "amount is required")
         @Positive(message = "amount must be greater than zero")
-        @JsonAlias({"paid_amount", "nilai", "paidAmount"})
+        @JsonAlias({"paid_amount", "paidAmount"})
         BigDecimal amount,
 
-        @JsonAlias({"payment_timestamp", "tanggalTransaksi"})
+        @NotNull(message = "paymentTimestamp is required")
+        @JsonAlias({"payment_timestamp"})
         Instant paymentTimestamp
 ) {}

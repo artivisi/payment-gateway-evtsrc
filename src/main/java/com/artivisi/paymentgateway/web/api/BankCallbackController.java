@@ -12,15 +12,15 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * Universal Bank Callback HTTP Controller.
+ * Generic / Maybank-shaped Bank Callback HTTP Controller.
  * Thin HTTP adapter: delegates all business logic and event log emission to PaymentApplicationService.
+ * BSI's proprietary payload is served by a dedicated controller, not this one.
  */
 @RestController
 @RequestMapping({
     "/api/payments",
     "/api/v1/payments",
-    "/api/bank/maybank/v1.0/transfer-va/payment",
-    "/api/bank/bsi"
+    "/api/bank/maybank/v1.0/transfer-va/payment"
 })
 public class BankCallbackController {
 
@@ -35,9 +35,22 @@ public class BankCallbackController {
     @PostMapping
     public ResponseEntity<PaymentCallbackResponse> handleBankCallback(@Valid @RequestBody PaymentCallbackRequest request) {
         try {
-            String eventId = paymentApplicationService.processPaymentCallback(request);
-            return ResponseEntity.status(HttpStatus.OK)
-                    .body(new PaymentCallbackResponse("SUCCESS", "Payment command accepted", eventId));
+            PaymentApplicationService.PaymentProcessingResult result = paymentApplicationService.processPayment(
+                    request.bankCode(),
+                    request.vaNumber(),
+                    request.bankReference(),
+                    request.amount(),
+                    request.paymentTimestamp()
+            );
+
+            HttpStatus httpStatus = switch (result.outcome()) {
+                case ACCEPTED, DUPLICATE -> HttpStatus.OK;
+                case REJECTED_INVALID_VA -> HttpStatus.NOT_FOUND;
+                case REJECTED_CHARGE_CLOSED, REJECTED_INVALID_AMOUNT, REJECTED_INVALID_REQUEST -> HttpStatus.BAD_REQUEST;
+            };
+
+            return ResponseEntity.status(httpStatus)
+                    .body(new PaymentCallbackResponse(result.outcome().name(), result.message(), result.eventId()));
         } catch (Exception e) {
             log.error("Failed to process payment callback", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)

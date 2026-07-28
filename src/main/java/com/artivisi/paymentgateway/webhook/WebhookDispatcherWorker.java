@@ -8,6 +8,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
+
 @Component
 public class WebhookDispatcherWorker {
 
@@ -19,25 +21,25 @@ public class WebhookDispatcherWorker {
         this.objectMapper = objectMapper;
     }
 
+    // Batch signature: the default listener container factory runs in batch mode
+    // (spring.kafka.listener.type=batch) so the projection sink can amortize its DB writes per
+    // poll; this listener shares that factory and must accept a batch too.
     @KafkaListener(
         topics = "${app.topics.payment-events:payment-events}",
         groupId = "payment-gateway-webhook-dispatcher"
     )
-    public void consumePaymentEventForWebhook(String eventJson) {
-        try {
-            JsonNode root = objectMapper.readTree(eventJson);
+    public void consumePaymentEventsForWebhook(List<String> eventJsons) {
+        for (String eventJson : eventJsons) {
+            try {
+                JsonNode root = objectMapper.readTree(eventJson);
 
-            if (root.has("bankReference") && !root.has("existingBankCode")) {
-                PaymentReceivedEvent event = objectMapper.treeToValue(root, PaymentReceivedEvent.class);
-
-                log.info("Webhook Dispatcher processing webhook for client application: chargeId={}, amount={}, bank={}",
-                        event.chargeId(), event.amount(), event.bankCode());
-
-                // Simulated HTTP Webhook Dispatch
-                dispatchWebhookToClient(event);
+                if (root.has("bankReference") && !root.has("existingBankCode")) {
+                    PaymentReceivedEvent event = objectMapper.treeToValue(root, PaymentReceivedEvent.class);
+                    dispatchWebhookToClient(event);
+                }
+            } catch (Exception e) {
+                log.error("Failed to process webhook event dispatch: {}", eventJson, e);
             }
-        } catch (Exception e) {
-            log.error("Failed to process webhook event dispatch: {}", eventJson, e);
         }
     }
 
