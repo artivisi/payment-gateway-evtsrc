@@ -224,16 +224,28 @@ def is_accepted_outcome(outcome):
 
 def is_double_settlement_outcome(outcome):
     """
-    A payment rejected because the charge was already PAID is NOT a payment the system silently
-    drops -- per docs/benchmark-remediation-guideline.md G1/G2, PaymentApplicationService and
-    PaymentGatewayStreamsTopology both emit a DoubleSettlementDetectedEvent for this case instead
-    of absorbing the overpayment, and PostgresProjectionSink projects it as exactly one
-    payment_projection row with is_double_settlement=true. The BSI wire protocol maps this (and
-    the still-unimplemented per-charge-type amount check) to responseCode "13", which
-    classifyOutcome() labels REJECTED_CHARGE_CLOSED_OR_INVALID_AMOUNT. Treating this bucket as
-    "must have zero rows" (as an earlier version of this check did) is a false positive: it is a
-    rejection from the caller's point of view AND a correctly-flagged row from the ledger's point
-    of view, simultaneously -- that is the whole point of "never silently absorbed".
+    responseCode "13" (classifyOutcome()'s REJECTED_CHARGE_CLOSED_OR_INVALID_AMOUNT) covers two
+    legitimately different DB footprints across the two systems under test, and this check accepts
+    either -- what it must NOT accept is a silent, unflagged double-charge:
+
+    - evtsrc (PaymentApplicationService / PaymentGatewayStreamsTopology, see
+      docs/benchmark-remediation-guideline.md G1/G2): every attempted overpayment against an
+      already-PAID charge emits a DoubleSettlementDetectedEvent, projected as exactly ONE
+      payment_projection row with is_double_settlement=true -- "never silently absorbed" means
+      every attempt is visible.
+    - payment-gateway (RDBMS): a payment against an already-CLOSED charge is caught by the
+      pessimistic lock before any row is written and rejected with ZERO footprint in the `payment`
+      table -- only a genuine concurrent race (two requests both passing validation before either
+      commits) creates a flagged discrepancy record. Under this benchmark's workload (a handful of
+      VAs hammered continuously for 90s), the overwhelming majority of "13" responses hit a charge
+      that was *already* closed by an earlier, already-committed request -- the ordinary case, not
+      the race -- so a clean zero-row rejection is the CORRECT outcome, not a defect.
+
+    Earlier versions of this check got this wrong in both directions: assuming zero rows always
+    (a false positive against evtsrc) and then assuming exactly one flagged row always (a false
+    positive against the RDBMS baseline). The actual invariant that must hold on either system:
+    zero rows, or exactly one row and it IS flagged. A row that exists but is NOT flagged means the
+    overpayment was silently counted as a real payment -- that is the one shape this must catch.
     """
     return outcome == "REJECTED_CHARGE_CLOSED_OR_INVALID_AMOUNT"
 
@@ -289,12 +301,17 @@ def cross_check_k6_vs_db(ground_truth, db_rows):
             if rows:
                 recorded_in_db += 1
             flagged = [r for r in rows if r.get("is_double_settlement")]
-            if len(rows) != 1 or len(flagged) != 1:
+            # Valid: zero rows (clean pre-write rejection, e.g. RDBMS's pessimistic-lock path), or
+            # exactly one row and it IS flagged (evtsrc's every-attempt visibility, or a genuine
+            # RDBMS race). Invalid: a row exists but isn't flagged (silent double-charge), or more
+            # than one row.
+            valid = len(rows) == 0 or (len(rows) == 1 and len(flagged) == 1)
+            if not valid:
                 disagreements.append({
                     "bankReference": bank_reference,
                     "k6Outcome": outcome,
                     "httpStatus": info.get("httpStatus"),
-                    "expectedRows": "1 (is_double_settlement=true)",
+                    "expectedRows": "0, or 1 (is_double_settlement=true)",
                     "actualRows": f"{len(rows)} ({len(flagged)} flagged)",
                     "rows": rows,
                 })
