@@ -101,7 +101,45 @@ runs, which was not done here.
 
 ---
 
-## 4. Financial correctness audit (`scenarios/verify-correctness.py`)
+## 4. Knee / saturation analysis (from the raw time series)
+
+The aggregate percentiles in §2 average over the whole 90s run. [`scenarios/knee-analysis.py`](knee-analysis.py)
+buckets each run's raw `--out json` export into the ramp's own stage windows (matching the script's
+own `stages` config: 0–15s ramping to 500 TPS, 15–45s to 1,000 TPS, 45–75s to 2,000 TPS, 75–90s
+ramp-down) and reports observed TPS and latency percentiles per window — showing *where in the ramp*
+any knee or saturation actually happens, not just the run-wide average.
+
+**evtsrc — both runs**: flat. p50 stays 3.9–4.4ms across every stage including the 1,000→2,000 TPS
+window; p99 grows mildly (10–14ms in the early stages to 24–33ms at peak concurrency) but there is no
+sharp knee anywhere in the tested range.
+
+**RDBMS Run 1**: similarly flat and faster (p50 0.6–1.1ms throughout), with a mild tail bump at peak
+concurrency (p99 6–10ms in the early stages → 34ms in the 1,000→2,000 TPS window) — the same shape as
+evtsrc's, just at a lower absolute latency.
+
+**RDBMS Run 2**: a sharp, precisely located knee — not a uniform slowdown. The median stays low in
+every stage (p50 0.7–1.8ms, barely different from run 1), but the 1,000→2,000 TPS window's tail
+detaches from the rest of the run:
+
+| Stage | p50 | p95 | p99 |
+|---|---|---|---|
+| Ramp 50→500 TPS | 1.78ms | 7.42ms | 16.11ms |
+| Ramp 500→1,000 TPS | 0.71ms | 5.85ms | 50.29ms |
+| **Ramp 1,000→2,000 TPS** | 1.52ms | **369.72ms** | **534.60ms** |
+| Ramp-down | 1.34ms | 10.36ms | 29.39ms |
+
+This is the signature of lock-queue depth, not general slowdown: most requests still complete fast
+(the median barely moves), but as concurrent traffic crosses into the 1,000+ TPS range, enough
+transactions are simultaneously waiting on the same two `OPEN`-charge row locks (§3) that a growing
+tail gets stuck behind the queue — and the queue drains once the ramp starts coming back down. This
+directly corroborates §3's root cause with time-resolved evidence rather than just a whole-run
+average and a plausible story.
+
+Reproduce: `python3 scenarios/knee-analysis.py --raw scenarios/results/<file>-raw.json.gz`.
+
+---
+
+## 5. Financial correctness audit (`scenarios/verify-correctness.py`)
 
 | Run | k6 outcome log vs. recorded payment rows | RocksDB vs. Postgres (evtsrc only) |
 |---|---|---|
@@ -122,16 +160,18 @@ design — see G2 in the guideline).
 
 ---
 
-## 5. What's still needed for full confidence
+## 6. What's still needed for full confidence
 
 1. **Reset the database (or use fresh seed data) between runs.** The degradation in §3 is real, but
    it means these two runs measure "cold" vs. "warm-with-115k-rows-of-history," not two independent
    samples of the same condition. A clean comparison needs either a fresh schema per run or a much
    larger/more diverse VA pool so no single row absorbs tens of thousands of requests.
 2. **Dedicated (not shared) hardware.** All four runs shared this machine with other work.
-3. **A specific investigation into why RDBMS's tail degrades faster than evtsrc's** under the hot-row
-   condition in §3 — plausible (lock queueing depth scaling with concurrent waiters) but not
-   root-caused here; that's a targeted profiling task, not a benchmark-report claim.
+3. **Direct lock-wait telemetry to confirm §4's mechanism beyond time-correlated evidence.** The
+   knee analysis in §4 strongly corroborates lock-queue contention (tail-only degradation, precisely
+   located in the highest-concurrency stage, median unaffected) but no `pg_locks`/`pg_stat_activity`
+   capture was taken *during* the run to directly observe queued lock waiters — that's a targeted
+   profiling task, not something a benchmark report should assert without the capture behind it.
 
 No numbers above are invented or estimated — every figure comes from a committed artifact under
 `scenarios/results/` and a live `verify-correctness.py` run against it.

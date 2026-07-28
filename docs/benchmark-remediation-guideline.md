@@ -367,10 +367,13 @@ disagreeing on the numbers to surface it.
    log -- all four runs (2 per system). Projection lag was not explicitly polled to zero before
    auditing; the audits passing cleanly (no missing rows) is strong circumstantial evidence it had
    drained, not a directly measured guarantee.
-5. [PARTIAL] The report states accepted-payment counts and double-settlement-rejection counts
-   separately per system per run (`scenarios/perf_benchmark_report.md` §4). A time-bucketed
-   knee/saturation curve (TPS vs. latency over the 90s ramp, as the old fabricated report claimed to
-   have) was NOT reproduced from the real `--out json` time series -- the real finding that emerged
-   instead (§3 of that report: performance degrading under sustained load on a small hot-row
-   dataset, confirmed by direct DB inspection) is arguably more useful, but a literal knee-point
-   analysis remains undone if it's specifically wanted.
+5. [DONE] The report states accepted-payment counts and double-settlement-rejection counts
+   separately per system per run (`scenarios/perf_benchmark_report.md` §5). A real knee/saturation
+   analysis, time-bucketed from the actual `--out json` raw export by the new
+   `scenarios/knee-analysis.py` (not asserted from memory the way the old fabricated report was), is
+   in §4 of that report -- it precisely locates RDBMS run 2's degradation to the 1,000->2,000 TPS
+   stage specifically, tail-only (median barely moves, p99 jumps from ~50ms to ~535ms), directly
+   corroborating the lock-contention root cause in §3 with time-resolved evidence rather than just a
+   whole-run average and a plausible story. This was initially skipped in favor of other work and
+   only done after being asked "why didn't you" -- a reminder to finish a stated scope rather than
+   quietly downgrading it to "partial" and moving on.
