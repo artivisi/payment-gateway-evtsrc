@@ -442,21 +442,14 @@ A key architectural design question when building payment gateways is whether to
 
 ### 3.6 Initial Deployment Seeding for Pre-Existing Virtual Accounts & Charges
 
-When deploying `payment-gateway-evtsrc` into an existing enterprise environment with pre-existing charges and bank VAs, initial state can be loaded directly from a **PostgreSQL database dump** or **CSV export** without custom database bypasses on the hot path:
+When deploying `payment-gateway-evtsrc` into an existing enterprise environment with pre-existing charges and bank VAs, initial state can be loaded directly from a **PostgreSQL database dump**, via `PostgresInitialStateSeeder`:
 
-#### Option A: PostgreSQL Database Dump Seeding (`PostgresInitialStateSeeder`) — Recommended for DBAs
 1. **Database Dump Import**: DBAs restore legacy tables directly into PostgreSQL tables (`charge_projection`, `sibling_va_projection`).
-2. **On-Startup Event Emission**: When `app.migration.seed-from-postgres=true` is set, `PostgresInitialStateSeeder` runs on application startup:
+2. **On-Startup Registration**: When `app.migration.seed-from-postgres=true` is set and the settlement store is empty, `PostgresInitialStateSeeder` runs on application startup:
    - Reads active pre-existing charges and Virtual Accounts from PostgreSQL.
-   - Emits synthetic `ChargeCreatedEvent` records to `charge-events` and `SiblingVaRegisteredEvent` records to `va-events` with historical timestamps.
-3. **Automated Kafka Streams & RocksDB Hydration**:
-   - `PaymentGatewayStreamsTopology` consumes these initial events and populates local off-heap RocksDB state stores (`charge-state-store`, `va-registry-store`).
-4. **Cold-Start & Failover Resilience**:
-   - Kafka Streams automatically writes backup records to Kafka broker changelog topics (`...-changelog`). Any future container restarts or node scale-outs re-hydrate RocksDB directly from Kafka changelogs without querying PostgreSQL again.
-
-#### Option B: External CSV / Payload Seeding (`InitialStateSeeder`)
-1. **Migration Script / CLI Tool**: An external migration worker or script reads CSV legacy data files.
-2. **Direct Kafka Event Emission**: `InitialStateSeeder.seedInitialState(...)` emits synthetic events directly into Kafka topics (`charge-events`, `va-events`).
+   - Registers each one directly into `ChargeSettlementStore` (the same RocksDB `TransactionDB` the request-thread write path owns), synchronously, so they are resolvable via inquiry/payment the instant seeding finishes.
+   - Also emits the equivalent `ChargeCreatedEvent`/`SiblingVaRegisteredEvent` records to `charge-events`/`va-events`, purely so `PostgresProjectionSink` builds the matching read model.
+3. **Idempotent re-run guard, not changelog-backed durability**: `ChargeSettlementStore` is a plain, directly-owned RocksDB directory with no Kafka Streams changelog behind it. If `app.settlement-store.dir` is a persistent volume, the directory survives a restart and the seeder detects existing state and skips re-seeding. If it isn't, the store comes back empty and the seeder runs again on the next restart -- give it a persistent volume for a real migration.
 
 ---
 

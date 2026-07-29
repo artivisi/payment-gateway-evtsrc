@@ -21,18 +21,21 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Migration Seeder from PostgreSQL to Kafka & RocksDB.
- * 
- * Cold-Start Differentiation:
- * 1. Initial Migration Cold-Start (from PostgreSQL):
- *    - Triggered ONLY when app.migration.seed-from-postgres=true AND local RocksDB state store is empty (0 entries).
- *    - Reads PostgreSQL dump tables and emits initial synthetic ChargeCreatedEvent / SiblingVaRegisteredEvent records.
- * 
- * 2. Subsequent Operational Cold-Starts (from Kafka Changelogs):
- *    - When the container restarts after routine deployment or failure, RocksDB state stores are automatically
- *      re-hydrated by Kafka Streams directly from Kafka broker changelog topics (...-changelog).
- *    - PostgresInitialStateSeeder detects existing state in RocksDB / Kafka and SKIPS PostgreSQL seeding automatically
- *      to prevent duplicate event emission.
+ * Migration Seeder from PostgreSQL to {@link ChargeSettlementStore} & Kafka.
+ *
+ * Runs once, on {@link ApplicationReadyEvent}, only when {@code app.migration.seed-from-postgres=true}
+ * AND the settlement store is empty ({@link #isAlreadySeeded()}). Registers each pre-existing charge
+ * and its sibling VAs directly into {@link ChargeSettlementStore} (synchronously, the same call path
+ * {@link com.artivisi.paymentgateway.service.ChargeApplicationService#createCharge} uses), then emits
+ * the equivalent {@code ChargeCreatedEvent}/{@code SiblingVaRegisteredEvent} records to Kafka purely
+ * for {@code PostgresProjectionSink}'s read model.
+ *
+ * {@link ChargeSettlementStore} is a plain, directly-owned RocksDB directory (see its own Javadoc) --
+ * there is no Kafka Streams changelog backing it, so nothing re-hydrates it from Kafka on restart. If
+ * {@code app.settlement-store.dir} points at a persistent volume, the directory survives a container
+ * restart and {@link #isAlreadySeeded()} correctly skips reseeding. If it does not (ephemeral storage),
+ * the store comes back empty and this seeder runs again on every restart -- operators relying on this
+ * path for a real migration must give the settlement store a persistent volume.
  */
 @Service
 public class PostgresInitialStateSeeder {
