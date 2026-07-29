@@ -223,6 +223,55 @@ class BankCallbackControllerIntegrationTest extends AbstractIntegrationTest {
                 });
     }
 
+    @Test
+    @DisplayName("REAL INTEGRATION: Settling a CLOSED charge marks the paying VA PAID and its sibling CANCELLED -- both stop resolving on inquiry")
+    void testPaymentCallback_ClosedChargeSettlement_PaidVaAndCancelledSiblingBothStopResolvingOnInquiry() {
+        String payingVaNumber = "8801928375";
+        String siblingVaNumber = "8801928376";
+        BigDecimal totalAmount = new BigDecimal("650000.00");
+
+        CreateChargeRequest chargeRequest = new CreateChargeRequest(
+                "CLIENT-CALLBACK-TEST",
+                "CLOSED",
+                totalAmount,
+                "Sibling VA settlement test charge",
+                List.of(new SiblingVaRequest("BSI", payingVaNumber), new SiblingVaRequest("MAYBANK", siblingVaNumber))
+        );
+        ResponseEntity<CreateChargeResponse> chargeResponse = restTemplate.postForEntity(
+                "/api/v1/charges", chargeRequest, CreateChargeResponse.class);
+        assertThat(chargeResponse.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        String chargeId = chargeResponse.getBody().chargeId();
+
+        TestSupport.awaitChargeStatus(restTemplate, chargeId, "ACTIVE");
+        TestSupport.awaitVaResolvable(restTemplate, "BSI", payingVaNumber);
+        TestSupport.awaitVaResolvable(restTemplate, "MAYBANK", siblingVaNumber);
+
+        PaymentCallbackRequest settlingPayment = new PaymentCallbackRequest(
+                "BSI", payingVaNumber, "REF-" + UUID.randomUUID(), totalAmount, Instant.now());
+        ResponseEntity<PaymentCallbackResponse> settling = postCallback(settlingPayment);
+        assertThat(settling.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(settling.getBody().status()).isEqualTo(PaymentOutcome.ACCEPTED.name());
+
+        TestSupport.awaitChargeStatus(restTemplate, chargeId, "PAID");
+
+        // The VA that actually received the payment: PAID, no longer resolvable.
+        ResponseEntity<String> payingVaInquiry = inquire("BSI", payingVaNumber);
+        assertThat(payingVaInquiry.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+
+        // Its sibling never received anything, but the charge it belongs to is now settled: CANCELLED,
+        // also no longer resolvable -- the number is free for the next charge to reuse.
+        ResponseEntity<String> siblingVaInquiry = inquire("MAYBANK", siblingVaNumber);
+        assertThat(siblingVaInquiry.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    private ResponseEntity<String> inquire(String bankCode, String vaNumber) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<InquiryController.AccountInquiryRequest> entity =
+                new HttpEntity<>(new InquiryController.AccountInquiryRequest(bankCode, vaNumber), headers);
+        return restTemplate.postForEntity("/api/v1/inquiry", entity, String.class);
+    }
+
     private static BigDecimal extractCumulativePaid(String chargeJson) {
         Pattern pattern = Pattern.compile("\"cumulativePaid\"\\s*:\\s*\"?(-?[0-9.]+)\"?");
         Matcher matcher = pattern.matcher(chargeJson);

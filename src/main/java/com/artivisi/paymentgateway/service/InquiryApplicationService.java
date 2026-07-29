@@ -52,22 +52,31 @@ public class InquiryApplicationService {
         String effectiveBankCode = bankCode != null ? bankCode : "GENERIC_BANK";
 
         try {
-            Optional<String> chargeId = settlementStore.resolveChargeId(effectiveBankCode, vaNumber);
-            if (chargeId.isEmpty()) {
+            Optional<ChargeSettlementStore.VaRecord> va = settlementStore.resolveVa(effectiveBankCode, vaNumber);
+            if (va.isEmpty()) {
                 return new InquiryResult("INVALID_VA", effectiveBankCode, vaNumber, null, null, "Virtual account not found");
             }
+            if (!"ACTIVE".equals(va.get().status())) {
+                return new InquiryResult("INVALID_VA", effectiveBankCode, vaNumber, null, null,
+                        "Virtual account is no longer active (status " + va.get().status() + ")");
+            }
 
-            Optional<String> chargeJson = settlementStore.getChargeJson(chargeId.get());
+            Optional<String> chargeJson = settlementStore.getChargeJson(va.get().chargeId());
             if (chargeJson.isEmpty()) {
                 return new InquiryResult("INVALID_CHARGE", effectiveBankCode, vaNumber, null, null, "Charge record not found for VA");
             }
 
             JsonNode node = objectMapper.readTree(chargeJson.get());
+            String chargeStatus = node.hasNonNull("status") ? node.get("status").asString() : null;
+            if (!"ACTIVE".equals(chargeStatus)) {
+                return new InquiryResult("INVALID_VA", effectiveBankCode, vaNumber, null, null,
+                        "Charge is no longer active (status " + chargeStatus + ")");
+            }
             String customerName = node.hasNonNull("description") ? node.get("description").asString() : "Customer";
             BigDecimal totalAmount = node.hasNonNull("totalAmount") ? new BigDecimal(node.get("totalAmount").asString()) : BigDecimal.ZERO;
 
             log.info("Account inquiry resolved for bankCode: {}, vaNumber: {}, chargeId: {}",
-                    effectiveBankCode, vaNumber, chargeId.get());
+                    effectiveBankCode, vaNumber, va.get().chargeId());
 
             return new InquiryResult("SUCCESS", effectiveBankCode, vaNumber, customerName, totalAmount, "Account inquiry successful");
 
