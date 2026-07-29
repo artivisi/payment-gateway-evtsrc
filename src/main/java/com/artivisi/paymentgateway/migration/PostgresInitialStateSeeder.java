@@ -6,19 +6,13 @@ import com.artivisi.paymentgateway.projection.entity.ChargeProjectionEntity;
 import com.artivisi.paymentgateway.projection.entity.SiblingVaProjectionEntity;
 import com.artivisi.paymentgateway.projection.repository.ChargeProjectionRepository;
 import com.artivisi.paymentgateway.projection.repository.SiblingVaProjectionRepository;
-import com.artivisi.paymentgateway.streams.StoreConstants;
+import com.artivisi.paymentgateway.settlement.ChargeSettlementStore;
 import tools.jackson.databind.ObjectMapper;
-import org.apache.kafka.streams.KafkaStreams;
-import org.apache.kafka.streams.StoreQueryParameters;
-import org.apache.kafka.streams.state.QueryableStoreTypes;
-import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
-import org.springframework.kafka.config.StreamsBuilderFactoryBean;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
@@ -47,11 +41,9 @@ public class PostgresInitialStateSeeder {
 
     private final ChargeProjectionRepository chargeProjectionRepository;
     private final SiblingVaProjectionRepository siblingVaProjectionRepository;
+    private final ChargeSettlementStore settlementStore;
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper;
-
-    @Autowired(required = false)
-    private StreamsBuilderFactoryBean streamsBuilderFactoryBean;
 
     @Value("${app.migration.seed-from-postgres:false}")
     private boolean seedFromPostgresEnabled;
@@ -64,10 +56,12 @@ public class PostgresInitialStateSeeder {
 
     public PostgresInitialStateSeeder(ChargeProjectionRepository chargeProjectionRepository,
                                       SiblingVaProjectionRepository siblingVaProjectionRepository,
+                                      ChargeSettlementStore settlementStore,
                                       KafkaTemplate<String, String> kafkaTemplate,
                                       ObjectMapper objectMapper) {
         this.chargeProjectionRepository = chargeProjectionRepository;
         this.siblingVaProjectionRepository = siblingVaProjectionRepository;
+        this.settlementStore = settlementStore;
         this.kafkaTemplate = kafkaTemplate;
         this.objectMapper = objectMapper;
     }
@@ -79,31 +73,23 @@ public class PostgresInitialStateSeeder {
             return;
         }
 
-        // Automatic Safeguard: Check if RocksDB / Kafka already contains populated state
+        // Automatic Safeguard: Check if the settlement store already contains populated state
         if (isAlreadySeeded()) {
-            log.info("Kafka Streams RocksDB state store already contains populated state. Skipping PostgreSQL seeding to prevent duplicate event emission.");
+            log.info("ChargeSettlementStore already contains populated state. Skipping PostgreSQL seeding to prevent duplicate event emission.");
             return;
         }
 
-        log.info("app.migration.seed-from-postgres is ENABLED and RocksDB state store is empty. Starting initial PostgreSQL -> Kafka/RocksDB state migration seeder...");
+        log.info("app.migration.seed-from-postgres is ENABLED and the settlement store is empty. Starting initial PostgreSQL -> Kafka/RocksDB state migration seeder...");
         seedFromPostgres();
     }
 
     public boolean isAlreadySeeded() {
-        if (streamsBuilderFactoryBean != null) {
-            try {
-                KafkaStreams kafkaStreams = streamsBuilderFactoryBean.getKafkaStreams();
-                if (kafkaStreams != null && kafkaStreams.state() == KafkaStreams.State.RUNNING) {
-                    ReadOnlyKeyValueStore<String, String> chargeStore = kafkaStreams.store(
-                            StoreQueryParameters.fromNameAndType(StoreConstants.CHARGE_STATE_STORE, QueryableStoreTypes.keyValueStore())
-                    );
-                    return chargeStore.approximateNumEntries() > 0;
-                }
-            } catch (Exception e) {
-                log.debug("Unable to query RocksDB approximate entries during seeding check: {}", e.getMessage());
-            }
+        try {
+            return settlementStore.approximateKeyCount() > 0;
+        } catch (Exception e) {
+            log.debug("Unable to query ChargeSettlementStore approximate key count during seeding check: {}", e.getMessage());
+            return false;
         }
-        return false;
     }
 
     public int seedFromPostgres() {
@@ -112,24 +98,33 @@ public class PostgresInitialStateSeeder {
 
         try {
             List<ChargeProjectionEntity> charges = chargeProjectionRepository.findAll();
-            log.info("Found {} pre-existing charges in PostgreSQL database to migrate into Kafka & RocksDB", charges.size());
+            log.info("Found {} pre-existing charges in PostgreSQL database to migrate into the settlement store & Kafka", charges.size());
 
             for (ChargeProjectionEntity charge : charges) {
-                // 1. Emit ChargeCreatedEvent to Kafka topic
+                Instant chargeTimestamp = charge.getCreatedAt() != null ? charge.getCreatedAt() : now;
+                var totalAmount = charge.getRemainingAmount() != null ? charge.getRemainingAmount() : charge.getTotalAmount();
+
+                // 1. Register synchronously into the settlement store (source of truth).
+                settlementStore.registerCharge(charge.getId().toString(), charge.getClientId(),
+                        charge.getChargeType(), totalAmount, charge.getDescription(), chargeTimestamp);
+
+                // 2. Emit ChargeCreatedEvent for the read model.
                 ChargeCreatedEvent chargeEvent = new ChargeCreatedEvent(
                         UUID.randomUUID().toString(),
                         charge.getId().toString(),
                         charge.getClientId(),
                         charge.getChargeType(),
-                        charge.getRemainingAmount() != null ? charge.getRemainingAmount() : charge.getTotalAmount(),
+                        totalAmount,
                         charge.getDescription(),
-                        charge.getCreatedAt() != null ? charge.getCreatedAt() : now
+                        chargeTimestamp
                 );
                 kafkaTemplate.send(chargeEventsTopic, charge.getId().toString(), objectMapper.writeValueAsString(chargeEvent)).get();
 
-                // 2. Fetch and emit SiblingVaRegisteredEvents for this charge
+                // 3. Fetch, register, and emit SiblingVaRegisteredEvents for this charge
                 List<SiblingVaProjectionEntity> vas = siblingVaProjectionRepository.findByChargeId(charge.getId());
                 for (SiblingVaProjectionEntity va : vas) {
+                    settlementStore.registerVa(va.getBankCode(), va.getVaNumber(), charge.getId().toString());
+
                     SiblingVaRegisteredEvent vaEvent = new SiblingVaRegisteredEvent(
                             UUID.randomUUID().toString(),
                             charge.getId().toString(),
@@ -143,10 +138,10 @@ public class PostgresInitialStateSeeder {
                 seededChargeCount++;
             }
 
-            log.info("PostgreSQL -> Kafka/RocksDB state seeder completed successfully. Seeded {} charges and associated VAs.", seededChargeCount);
+            log.info("PostgreSQL -> settlement store & Kafka seeder completed successfully. Seeded {} charges and associated VAs.", seededChargeCount);
 
         } catch (Exception e) {
-            log.error("Failed during PostgreSQL -> Kafka/RocksDB state migration seeding", e);
+            log.error("Failed during PostgreSQL -> settlement store & Kafka migration seeding", e);
         }
 
         return seededChargeCount;

@@ -24,21 +24,17 @@ spring:
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
-    streams:
-      application-id: payment-gateway-streams-engine
-      properties:
-        default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
-        default.value.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
-        state.dir: ${ROCKSDB_STATE_DIR:./target/rocksdb}
-        num.stream.threads: 6
-        num.standby.replicas: 0 # Starter 1-node footprint setup
     listener:
       type: batch
       concurrency: ${app.kafka.partitions:6}
 
 app:
   kafka:
-    partitions: ${APP_KAFKA_PARTITIONS:6} # Starter tier partition count per README §4.3; drives topic creation + listener/streams concurrency
+    partitions: ${APP_KAFKA_PARTITIONS:6} # Starter tier partition count per README §4.3; drives topic creation + listener concurrency
+  settlement-store:
+    # ChargeSettlementStore's directly-owned RocksDB TransactionDB directory -- the source of
+    # truth for charge/VA/payment state. Not a Kafka Streams state store; see the class Javadoc.
+    dir: ${SETTLEMENT_STORE_DIR:./target/settlement-store}
   topics:
     charge-events: charge-events
     va-events: va-events

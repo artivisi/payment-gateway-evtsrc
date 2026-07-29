@@ -1,36 +1,32 @@
 package com.artivisi.paymentgateway.service;
 
-import com.artivisi.paymentgateway.streams.StoreConstants;
+import com.artivisi.paymentgateway.settlement.ChargeSettlementStore;
 import com.artivisi.paymentgateway.web.api.InquiryController;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
-import org.apache.kafka.streams.KafkaStreams;
-import org.apache.kafka.streams.StoreQueryParameters;
-import org.apache.kafka.streams.state.QueryableStoreTypes;
-import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.kafka.config.StreamsBuilderFactoryBean;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.util.Optional;
 
 /**
  * Application Service for Bank Account Inquiry.
- * Encapsulates off-heap RocksDB state store queries (<1ms) and response resolution.
+ * Reads directly from {@link ChargeSettlementStore} -- the same local RocksDB transaction store
+ * the write path uses, so an inquiry can never observe state that disagrees with what a payment
+ * against the same VA would see.
  */
 @Service
 public class InquiryApplicationService {
 
     private static final Logger log = LoggerFactory.getLogger(InquiryApplicationService.class);
 
+    private final ChargeSettlementStore settlementStore;
     private final ObjectMapper objectMapper;
 
-    @Autowired(required = false)
-    private StreamsBuilderFactoryBean streamsBuilderFactoryBean;
-
-    public InquiryApplicationService(ObjectMapper objectMapper) {
+    public InquiryApplicationService(ChargeSettlementStore settlementStore, ObjectMapper objectMapper) {
+        this.settlementStore = settlementStore;
         this.objectMapper = objectMapper;
     }
 
@@ -55,51 +51,28 @@ public class InquiryApplicationService {
     public InquiryResult inquireAccount(String bankCode, String vaNumber) {
         String effectiveBankCode = bankCode != null ? bankCode : "GENERIC_BANK";
 
-        if (streamsBuilderFactoryBean == null) {
-            log.warn("Kafka Streams builder not initialized; inquiry returning unavailable");
-            return new InquiryResult("ERROR", effectiveBankCode, vaNumber, null, null, "Streaming engine unavailable");
-        }
-
         try {
-            KafkaStreams kafkaStreams = streamsBuilderFactoryBean.getKafkaStreams();
-            if (kafkaStreams == null || kafkaStreams.state() != KafkaStreams.State.RUNNING) {
-                return new InquiryResult("ERROR", effectiveBankCode, vaNumber, null, null, "Streams state store re-balancing");
-            }
-
-            // 1. Query va-registry-store in local off-heap RocksDB (<1ms)
-            ReadOnlyKeyValueStore<String, String> vaStore = kafkaStreams.store(
-                    StoreQueryParameters.fromNameAndType(StoreConstants.VA_REGISTRY_STORE, QueryableStoreTypes.keyValueStore())
-            );
-            String lookupKey = effectiveBankCode + "_" + vaNumber;
-            String chargeId = vaStore.get(lookupKey);
-            if (chargeId == null && vaNumber != null) {
-                chargeId = vaStore.get(vaNumber);
-            }
-
-            if (chargeId == null) {
+            Optional<String> chargeId = settlementStore.resolveChargeId(effectiveBankCode, vaNumber);
+            if (chargeId.isEmpty()) {
                 return new InquiryResult("INVALID_VA", effectiveBankCode, vaNumber, null, null, "Virtual account not found");
             }
 
-            // 2. Query charge-state-store in local off-heap RocksDB (<1ms)
-            ReadOnlyKeyValueStore<String, String> chargeStore = kafkaStreams.store(
-                    StoreQueryParameters.fromNameAndType(StoreConstants.CHARGE_STATE_STORE, QueryableStoreTypes.keyValueStore())
-            );
-            String chargeJson = chargeStore.get(chargeId);
-            if (chargeJson == null) {
+            Optional<String> chargeJson = settlementStore.getChargeJson(chargeId.get());
+            if (chargeJson.isEmpty()) {
                 return new InquiryResult("INVALID_CHARGE", effectiveBankCode, vaNumber, null, null, "Charge record not found for VA");
             }
 
-            JsonNode node = objectMapper.readTree(chargeJson);
+            JsonNode node = objectMapper.readTree(chargeJson.get());
             String customerName = node.hasNonNull("description") ? node.get("description").asString() : "Customer";
             BigDecimal totalAmount = node.hasNonNull("totalAmount") ? new BigDecimal(node.get("totalAmount").asString()) : BigDecimal.ZERO;
 
-            log.info("Account inquiry resolved in RocksDB for bankCode: {}, vaNumber: {}, chargeId: {}",
-                    effectiveBankCode, vaNumber, chargeId);
+            log.info("Account inquiry resolved for bankCode: {}, vaNumber: {}, chargeId: {}",
+                    effectiveBankCode, vaNumber, chargeId.get());
 
             return new InquiryResult("SUCCESS", effectiveBankCode, vaNumber, customerName, totalAmount, "Account inquiry successful");
 
         } catch (Exception e) {
-            log.error("Account inquiry failed in RocksDB for vaNumber: {}", vaNumber, e);
+            log.error("Account inquiry failed for vaNumber: {}", vaNumber, e);
             return new InquiryResult("ERROR", effectiveBankCode, vaNumber, null, null, "Inquiry processing error: " + e.getMessage());
         }
     }

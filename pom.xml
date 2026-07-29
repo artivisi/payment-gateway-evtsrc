@@ -58,14 +58,10 @@
             <artifactId>spring-boot-restclient</artifactId>
         </dependency>
 
-        <!-- Apache Kafka & Kafka Streams -->
+        <!-- Apache Kafka (fact broadcast to the read model) + RocksDB (direct, request-thread-owned settlement store) -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-kafka</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.kafka</groupId>
-            <artifactId>kafka-streams</artifactId>
         </dependency>
         <dependency>
             <groupId>org.rocksdb</groupId>

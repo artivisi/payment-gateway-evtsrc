@@ -10,10 +10,8 @@ import org.springframework.kafka.config.TopicBuilder;
  * Explicit topic provisioning.
  *
  * Without these beans, every topic referenced by producers/consumers auto-creates with the
- * broker default of 1 partition regardless of {@code num.stream.threads} — see
- * benchmark-remediation-guideline.md F4/G3. Partition count is driven by
- * {@code app.kafka.partitions} so it stays in sync with
- * {@code spring.kafka.streams.properties.num.stream.threads} and
+ * broker default of 1 partition — see benchmark-remediation-guideline.md F4/G3. Partition count
+ * is driven by {@code app.kafka.partitions} so it stays in sync with
  * {@code spring.kafka.listener.concurrency}.
  */
 @Configuration
