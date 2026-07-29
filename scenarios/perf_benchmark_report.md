@@ -7,32 +7,30 @@ baseline), benchmarked head-to-head through the identical BSI protocol workload.
 
 ---
 
-## Retraction: the same-day morning run's saturation and correctness-defect findings did not reproduce
+## Two same-day corrections: a retraction, and then a correction to the retraction
 
 An earlier version of this file, written the same morning, reported evtsrc saturating well before
 the 2,000 TPS ramp completed (p99 1.16s–3.22s, needing 1,200+ VUs) and a financial-correctness
-defect in both of its two runs (one payment double-recorded per run). Shortly after that report was
-written, the operator restarted the machine after finding OrbStack running a hanging VM, and
-separately flagged "a severe resource hogging problem" from that session. This afternoon's re-run —
-on a freshly-restarted machine, with the environment explicitly checked for contamination before
-each load-generation phase (see §1) — reproduced **neither** finding:
+defect in both of its two runs (one payment double-recorded per run). Shortly after, the operator
+restarted the machine after finding OrbStack running a hanging VM, and separately flagged "a severe
+resource hogging problem" from that session. Re-run on a freshly-restarted machine with an explicit
+contamination check added before each load-generation phase, **the saturation finding did not
+reproduce**: evtsrc's p99 was 8.5–9.4ms in both runs (vs. 1.16s–3.22s that morning), flat across
+every ramp stage, never exceeding its pre-allocated VU pool. That part of the morning's report is
+retracted — the saturation ceiling was a contamination artifact, not a property of evtsrc's
+architecture.
 
-- evtsrc's p99 was 8.5–9.4ms in both runs (vs. 1.16s–3.22s that morning), flat across every ramp
-  stage, never exceeding its pre-allocated VU pool.
-- Both evtsrc runs' correctness audits passed with **zero** mismatches on both checks (vs. one
-  double-recorded payment per run that morning).
+Both afternoon runs' correctness audits also passed with zero mismatches, and the first version of
+this section retracted the correctness-defect finding on that basis too. **That was wrong, and was
+corrected within the same session** after the operator pushed back: "the app should not do double
+payment however low the resource is, correct?" Not reproducing under a clean environment shows the
+defect is *rare*, not that it isn't *real* — those are different claims, and the first version of
+this report conflated them. The defect was investigated directly, root-caused, reproduced
+deterministically (with no dependency on load, timing, or machine state at all), and fixed. See §6.
 
-This is a retraction, not a refinement: the morning's numbers were real measurements (not
-fabricated), but the environment they were measured in was not what it was assumed to be — later
-found to include a hanging OrbStack VM, and, separately, this session directly observed another
-Testcontainers-based test session spinning up containers on the same Docker daemon during setup.
-**Neither the saturation ceiling nor the double-write defect should be treated as a characteristic of
-evtsrc's architecture** until reproduced under a controlled environment; this afternoon's clean,
-twice-reproduced result is the current evidence, and it says the opposite. The morning's raw
-artifacts and analysis remain in `scenarios/results/2026-07-29-*` and in
-`docs/benchmark-remediation-guideline.md`'s "Fourth gap" for the record — they are a case study in
-environment contamination, not a benchmark result to design around. See "Fifth gap" in that
-document for the full account.
+The morning's raw artifacts remain in `scenarios/results/2026-07-29-*` and in
+`docs/benchmark-remediation-guideline.md`'s "Fourth gap" for the record; the retraction and its own
+correction are "Fifth gap" and "Sixth gap" in that same document.
 
 ---
 
@@ -151,25 +149,101 @@ ramp-down" signature the morning's evtsrc runs showed.
 
 All three runs pass cleanly on every check. Compare against the Fourth gap in
 `docs/benchmark-remediation-guideline.md`, where the same audit against the same code, the same
-scripts, and the same seed data failed identically in two out of two runs that morning.
+scripts, and the same seed data failed identically in two out of two runs that morning — and see §6
+below for why "these three runs passed" does not mean the defect that morning wasn't real.
 
 ---
 
-## 5. What's still needed for full confidence
+## 6. The double-write defect: root cause and fix (independent of load)
 
-1. **Dedicated (not shared) hardware** remains the biggest open gap — even this afternoon's clean
-   run shares the machine with background OS processes, and the morning's contamination episode is
-   a direct demonstration of how much that can matter for this specific comparison.
+The morning's defect — one `bankReference` recorded as both an accepted payment and a flagged
+double settlement — was investigated directly rather than left as "retracted, unexplained." Root
+cause: `PostgresProjectionSink` projects `PaymentReceivedEvent` and `DoubleSettlementDetectedEvent`
+through two independent methods that didn't check each other's work. `PaymentApplicationService`'s
+request-thread pre-validation can optimistically accept a payment that the Kafka Streams
+topology — the actual single-writer authority — later finds was already settled by a racing
+payment, and correctly emits a `DoubleSettlementDetectedEvent` for that same `bankReference`
+(exactly the residual pre-validation race the code's own comments document). The sink had already
+unconditionally inserted an "accepted" row for the optimistic accept, and then unconditionally
+inserted a second, contradicting row for the correction, instead of the correction retracting the
+first row in place.
+
+This is a pure logic defect, not fundamentally a low-resource phenomenon: resource contention only
+widens the timing window in which multiple concurrent requests can hit a brand-new `CLOSED` charge
+before the first one closes it — it doesn't create the race, it just makes it more likely to be hit.
+That means it can be reproduced and verified with no dependency on real load, real Kafka timing, or
+machine state at all. `src/test/java/.../projection/sink/PostgresProjectionSinkTest.java` does
+exactly that: it calls `PostgresProjectionSink.consumeDomainEvents(List)` directly with a
+hand-crafted `PaymentReceivedEvent` followed by a `DoubleSettlementDetectedEvent` for the same
+`bankReference` — no Kafka, no concurrency, no timing dependency. Verified against the pre-fix code,
+it fails every time (`Expected size: 1 but was: 2`); against the fix, it passes every time. This is
+stronger evidence than another load-test run would have been — the defect's hit rate that morning
+(roughly 1 in 26,000–27,000 accepted payments) means a clean load-test run proves little either way;
+a deterministic test proves it every time.
+
+Fixed in `PostgresProjectionSink.projectDoubleSettlementBatch`: it now looks up any existing payment
+row for the incoming event's `(bankCode, bankReference)` and, if found, flips it to
+`isDoubleSettlement=true` in place — and retracts its amount from the charge's paidAmount/status via
+the new `correctChargesForRetractedPayments` — instead of inserting a second, contradicting row. The
+normal case (a `bankReference` that was always going to be rejected and never optimistically
+accepted) is unaffected and covered by a second test.
+
+**The lesson**: "didn't reproduce under a clean environment" is evidence about how *often* a defect
+manifests, not evidence about whether it's real. A correctness defect that only shows up "sometimes,
+under load" is still a correctness defect a payment gateway cannot have — production systems
+experience exactly that kind of contention (GC pauses, CPU spikes, slow disks) as routine operating
+conditions, not as a benchmark edge case to discount.
+
+### Does the fix have a request-latency cost? No — it's on a fully async path
+
+The fix lives in `PostgresProjectionSink`, a Kafka consumer that runs after the HTTP response has
+already been sent back to the bank — it never touches the request thread that k6's p50/p95/p99
+numbers measure. A k6 re-run therefore cannot show a different *latency* number because of this fix,
+and didn't need to be run for that reason.
+
+What the fix *could* plausibly affect is **projection lag** — how far the async Postgres read model
+falls behind the write path under sustained throughput, since `projectDoubleSettlementBatch` now
+does one additional batched, indexed lookup per poll (`findByBankReferenceIn`) instead of none. This
+was checked directly: one full k6 run (`RUN_ID 20260729081443`, same ramp profile, same seed) with
+`GET /api/admin/debug/projection-lag` (exposed for exactly this purpose, per G3) polled roughly every
+9 seconds throughout.
+
+| Elapsed | Lag (ms) |
+|---|---|
+| ~9s | 4 |
+| ~18s | 6 |
+| ~27s | 4 |
+| ~36s | 1 |
+| ~45s | 1 |
+| ~54s | 3 |
+| ~63s | 1 |
+| ~72s | 3 |
+| ~81s | 8 |
+| ~90s | 8 |
+| ~93s (after ramp-down) | 8 |
+
+Lag stayed in single-digit milliseconds throughout, including the 1,000→2,000 TPS peak — no growth,
+no backlog. Request latency in this same run (p99 10.72ms, 86,572 requests, 0 dropped-iteration
+concerns beyond the usual) matched the other clean afternoon runs, and the correctness audit passed
+with zero mismatches on both checks. The added query does not create a bottleneck at this workload's
+scale.
+
+---
+
+## 7. What's still needed for full confidence
+
+1. **Dedicated (not shared) hardware** remains an open gap for the *performance* numbers — even this
+   afternoon's clean run shares the machine with background OS processes, and the morning's
+   contamination episode is a direct demonstration of how much that can matter. This does not apply
+   to §6's fix, which is verified independently of hardware or load.
 2. **A repeatable, scriptable environment-contamination check.** This pass's check
    (`docker ps -a` + `uptime`, done manually, twice, by eye) worked, but a small script that fails
    loudly if unrelated containers are churning or load average exceeds a threshold would make this
    procedure enforceable rather than a manual step someone can forget.
-3. **The morning's saturation and correctness-defect findings are retracted, not explained.** This
-   report does not know *why* resource contention (a hanging OrbStack VM, and/or a concurrent
-   Testcontainers session) would specifically produce a Kafka-Streams double-write rather than, say,
-   uniformly slower responses on both systems. If either finding recurs under a verified-clean
-   environment in the future, it should be treated as new evidence, not a confirmation of the
-   morning's report — this pass's data currently argues against it being real.
+3. **A confirmatory load-test run against the fix is optional, not required.** Given §6's
+   deterministic proof, a real k6 run would only add confidence that the fix holds in the full
+   system's context (no unexpected interaction with the actual Kafka Streams topology under real
+   throughput) — worth doing eventually, but not needed to trust the fix itself.
 4. RDBMS's hot-row lock-contention behavior (from an even earlier report, run against a long-lived,
    never-reset database) remains unverified in any of today's runs, which all started from empty
    databases by design.

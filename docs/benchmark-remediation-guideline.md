@@ -400,20 +400,68 @@ passed with zero mismatches on both checks (vs. one double-recorded payment per 
 RDBMS's own run was mildly noisier than its own best prior run (p99 112ms vs. 50ms) but showed no
 saturation shape either.
 
-**This means the Fourth gap's headline findings — evtsrc saturating around 1,000–2,000 TPS, and a
-reproducible financial-correctness defect — do not currently hold.** They were real measurements of
-a real but contaminated environment, not a fabrication and not (as far as this pass can tell) a
-latent bug reliably triggered by load. `scenarios/perf_benchmark_report.md` has been rewritten to
-lead with this retraction rather than quietly replacing the numbers, precisely because the old
-numbers were reported with the same confidence and the same audit-passing rigor the Third gap's fix
-was — a green audit and a clean-looking run are necessary but not sufficient; the actual machine
-state at the time of the run is a variable this project had not been controlling for, and evidently
-needed to.
+**The saturation finding does not currently hold** — it was a real measurement of a real but
+contaminated environment, not a fabrication and not (as far as this pass can tell) a latent
+performance ceiling. `scenarios/perf_benchmark_report.md` was rewritten to lead with this retraction
+rather than quietly replacing the numbers, precisely because the old numbers were reported with the
+same confidence and the same audit-passing rigor the Third gap's fix was — a green audit and a
+clean-looking run are necessary but not sufficient; the actual machine state at the time of the run
+is a variable this project had not been controlling for, and evidently needed to.
+
+**The financial-correctness defect is a different matter — see the Sixth gap below.** When the
+operator asked "the app should not do double payment however low the resource is, correct?", that
+was the right challenge to the framing above: contamination explaining why the defect *manifested*
+that morning is not the same as the defect not being real. Retracting it outright, as the paragraph
+above originally did, was a mistake corrected within the same session — see below for what the
+defect actually was and its fix.
 
 A reminder alongside the first four: this project's own stated purpose is catching exactly this
 class of error before it reaches a conclusion. Finding that its own most dramatic finding to date
 was itself a contamination artifact, one benchmark cycle later, is uncomfortable but is the system
-working as intended — better here than in a published comparison relied on for real decisions.
+working as intended — better here than in a published comparison relied on for real decisions. And
+per the Sixth gap, even that correction needed a correction: "unreproducible under a clean
+environment" was quietly treated as "not a real bug," which does not follow.
+
+### Sixth gap: the double-write defect was real, root-caused, and fixed — independent of load (2026-07-29, afternoon)
+
+Prompted by the operator's challenge above, the Fourth gap's financial-correctness defect (a single
+`bankReference` recorded as both an accepted payment and a flagged double settlement) was
+investigated directly rather than left as "retracted, mechanism unknown." The root cause:
+`PostgresProjectionSink` projects `PaymentReceivedEvent` and `DoubleSettlementDetectedEvent` through
+two independent methods (`projectPaymentReceivedBatch` / `projectDoubleSettlementBatch`) that did
+not check each other's work. `PaymentApplicationService`'s request-thread pre-validation can
+optimistically accept a payment (charge not yet `PAID` at its read) that the Kafka Streams
+topology — the actual single-writer authority — later finds was already settled by a racing
+payment, and correctly emits a `DoubleSettlementDetectedEvent` for that same `bankReference` per
+G2's design intent. `projectPaymentReceivedBatch` had already unconditionally inserted an "accepted"
+row for the optimistic accept, and `projectDoubleSettlementBatch` unconditionally inserted a second,
+contradicting row for the correction, instead of the correction retracting the first row in place.
+
+This is a pure logic defect, not fundamentally a low-resource phenomenon: resource contention only
+widens the timing window in which multiple concurrent requests can hit a brand-new `CLOSED` charge
+before the first one closes it (widening how *often* the race is hit), it does not create the race.
+That means it doesn't need real load, real Kafka timing, or a slow machine to reproduce or verify a
+fix against — it can be driven directly and deterministically. `PostgresProjectionSinkTest` does
+exactly that: it calls `PostgresProjectionSink.consumeDomainEvents(List)` directly with a
+hand-crafted `PaymentReceivedEvent` followed by a `DoubleSettlementDetectedEvent` for the same
+`bankReference`, with no Kafka, no concurrency, and no timing dependency at all. Verified against
+the pre-fix code, it fails every time (`Expected size: 1 but was: 2`); against the fix, it passes
+every time. This is stronger evidence than another load-test run would be — a load test's outcome
+here was probabilistic (the defect hit roughly 1 in 26,000–27,000 accepted payments), so a clean run
+would not have proven the fix, only failed to disprove it by chance.
+
+Fixed in `PostgresProjectionSink.projectDoubleSettlementBatch`: it now looks up any existing payment
+row for the incoming event's `(bankCode, bankReference)` and, if found, flips it to
+`isDoubleSettlement=true` in place (and retracts its amount from the charge's `paidAmount`/status via
+the new `correctChargesForRetractedPayments`) instead of inserting a second, contradicting row. The
+normal case — a `bankReference` that was always going to be rejected and never optimistically
+accepted — is unaffected (`PostgresProjectionSinkTest`'s second test covers it).
+
+The lesson compounds on the Fifth gap's: "it didn't reproduce under a clean environment" is evidence
+about *how often* a defect manifests, not evidence about whether it's real. A correctness defect in
+a payment gateway that only shows up "sometimes, under load" is still a correctness defect a payment
+gateway cannot have — production systems experience exactly that kind of contention (GC pauses, CPU
+spikes, slow disks) as a matter of course, not as an edge case to discount.
 
 ### Acceptance criteria for the re-benchmark
 

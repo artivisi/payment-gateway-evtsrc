@@ -249,11 +249,49 @@ public class PostgresProjectionSink {
     private void projectDoubleSettlementBatch(List<DoubleSettlementDetectedEvent> events) {
         if (events.isEmpty()) return;
 
+        Set<String> bankReferences = new HashSet<>();
+        for (DoubleSettlementDetectedEvent event : events) {
+            bankReferences.add(event.bankReference());
+        }
+
+        // A bankReference can already have an "accepted" row from projectPaymentReceivedBatch,
+        // projected optimistically by the request thread's pre-validation before the Kafka Streams
+        // topology -- the actual single-writer authority -- determined this payment should have
+        // been rejected as a double settlement instead (the residual pre-validation race
+        // PaymentApplicationService's own javadoc documents: "two concurrent callbacks can both
+        // pass this pre-check before either event is applied"). Once that authoritative decision
+        // arrives here, it must correct the existing row in place, not add a second, contradicting
+        // one for the same bankReference -- a single client-issued reference must never end up
+        // recorded as both an accepted payment and a flagged double settlement.
+        Map<String, PaymentProjectionEntity> existingByKey = new HashMap<>();
+        paymentRepo.findByBankReferenceIn(bankReferences)
+                .forEach(existing -> existingByKey.put(existing.getBankCode() + "_" + existing.getBankReference(), existing));
+
         List<PaymentProjectionEntity> toSave = new ArrayList<>();
+        Set<String> seenInBatch = new HashSet<>();
+        Set<UUID> chargeIdsToCorrect = new LinkedHashSet<>();
+        Map<UUID, BigDecimal> retractedAmountByCharge = new HashMap<>();
+
         for (DoubleSettlementDetectedEvent event : events) {
             UUID eventId = parseUUID(event.eventId());
             UUID chargeId = parseUUID(event.chargeId());
             if (eventId == null || chargeId == null) continue;
+
+            String key = event.bankCode() + "_" + event.bankReference();
+            if (!seenInBatch.add(key)) continue; // duplicate within this batch
+
+            PaymentProjectionEntity existing = existingByKey.get(key);
+            if (existing != null) {
+                if (!existing.isDoubleSettlement()) {
+                    // Was wrongly counted as an accepted payment; retract its contribution from
+                    // the charge below instead of leaving the ledger permanently inflated.
+                    retractedAmountByCharge.merge(existing.getChargeId(), existing.getAmount(), BigDecimal::add);
+                    chargeIdsToCorrect.add(existing.getChargeId());
+                }
+                existing.setDoubleSettlement(true);
+                toSave.add(existing);
+                continue;
+            }
 
             toSave.add(new PaymentProjectionEntity(
                     eventId,
@@ -271,6 +309,53 @@ public class PostgresProjectionSink {
         if (!toSave.isEmpty()) {
             paymentRepo.saveAll(toSave);
             log.warn("Projected {} DoubleSettlementDetectedEvent(s) to PostgreSQL", toSave.size());
+        }
+
+        if (!chargeIdsToCorrect.isEmpty()) {
+            correctChargesForRetractedPayments(chargeIdsToCorrect, retractedAmountByCharge);
+        }
+    }
+
+    /**
+     * Undoes the paidAmount/remainingAmount/status effect that {@link #projectPaymentReceivedBatch}
+     * applied for a payment later found (via a same- or later-batch {@code DoubleSettlementDetectedEvent})
+     * to have been an erroneously-accepted race loser, not a real settlement.
+     */
+    private void correctChargesForRetractedPayments(Set<UUID> chargeIds, Map<UUID, BigDecimal> retractedAmountByCharge) {
+        Map<UUID, ChargeProjectionEntity> charges = new HashMap<>();
+        chargeRepo.findAllById(chargeIds).forEach(charge -> charges.put(charge.getId(), charge));
+
+        for (UUID chargeId : chargeIds) {
+            ChargeProjectionEntity charge = charges.get(chargeId);
+            if (charge == null) continue; // charge projection not hydrated yet -- best-effort, matches projectPaymentReceivedBatch
+
+            BigDecimal retracted = retractedAmountByCharge.get(chargeId);
+            BigDecimal correctedPaid = charge.getPaidAmount().subtract(retracted);
+            charge.setPaidAmount(correctedPaid);
+
+            if ("OPEN".equals(charge.getChargeType())) {
+                charge.setRemainingAmount(charge.getTotalAmount().subtract(correctedPaid));
+                charge.setStatus(correctedPaid.signum() > 0 ? "PARTIALLY_PAID" : "ACTIVE");
+            } else {
+                BigDecimal remaining = charge.getTotalAmount().subtract(correctedPaid);
+                if (remaining.compareTo(BigDecimal.ZERO) < 0) {
+                    remaining = BigDecimal.ZERO;
+                }
+                charge.setRemainingAmount(remaining);
+                if (correctedPaid.signum() <= 0) {
+                    charge.setStatus("ACTIVE");
+                } else if (remaining.compareTo(BigDecimal.ZERO) == 0) {
+                    charge.setStatus("FULLY_PAID");
+                } else {
+                    charge.setStatus("PARTIALLY_PAID");
+                }
+            }
+            log.warn("Retracted erroneously-accepted payment amount {} from charge {} after a late double-settlement correction",
+                    retracted, chargeId);
+        }
+
+        if (!charges.isEmpty()) {
+            chargeRepo.saveAll(charges.values());
         }
     }
 
