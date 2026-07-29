@@ -299,3 +299,36 @@ symptom is patched" to "the mechanism that caused it no longer exists."
 
 No numbers above are invented or estimated — every figure comes from a committed artifact under
 `scenarios/results/` and a live `verify-correctness.py` / `knee-analysis.py` run against it.
+
+## 9. Per-VA status (paying VA PAID, siblings CANCELLED) added no cost either
+
+§8's `ChargeSettlementStore` tracked only charge-level status. A closer look (prompted while writing
+up §8 for publication) found it should track per-VA status too — the RDBMS reference implementation
+marks the VA that actually received payment `PAID` and every sibling `CANCELLED`, not all of them
+`PAID` — and that `InquiryApplicationService` didn't check status at all, so an inquiry against a
+settled charge's VA (paying or sibling) still returned `SUCCESS`. Fixed: VA records now carry their
+own `ACTIVE`/`PAID`/`CANCELLED` status, updated inside the same atomic settlement transaction, and
+inquiry checks it. See `docs/benchmark-remediation-guideline.md`'s "Eighth gap" for the full account,
+including a regression this caught and fixed along the way (`applyPayment`'s own VA lookup still
+assumed the old raw-string value format after VA records moved to JSON).
+
+Re-benchmarked twice, fresh environment each time (one contaminated attempt — an unrelated project's
+Maven build running concurrently on the same machine — discarded and re-run rather than reported):
+
+| Metric | Run 1 (`vastatus1`) | Run 2 (`vastatus2`) | §8's runs (for comparison) |
+|---|---|---|---|
+| Run ID | `20260729181245` | `20260729201858` | `20260729162811` / `20260729163104` |
+| p99 latency | 9.19ms | 8.65ms | 9.96ms / 9.85ms |
+| Peak VUs (of 2,000 allotted) | 46 | 31 | 32 / 33 |
+| Correctness audit | PASS, 0 mismatches (both checks) | PASS, 0 mismatches (both checks) | PASS, 0 mismatches |
+
+Also confirmed live, not just via the test suite: inquiring a settled charge's VA against the running
+benchmark instance now returns `{"status":"INVALID_VA","message":"...no longer active (status
+PAID)"}` with HTTP 404, where it previously returned `SUCCESS`.
+
+Caveat worth stating plainly: `scenarios/suite-bsi.js` registers exactly one BSI sibling per seeded
+charge, so this benchmark never exercises cancelling more than one sibling per settlement. A
+multi-sibling pay-via-any-bank charge walks one prefix-scanned `getForUpdate` + JSON parse/serialize
+per sibling inside the same transaction the bank's HTTP response waits on — plausibly still cheap at
+the small sibling counts (2-3 banks) this domain expects, but that specific path remains unmeasured
+here, not confirmed cheap by this data.

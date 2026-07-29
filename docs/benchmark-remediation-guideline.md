@@ -523,6 +523,65 @@ deeper than expected. The Sixth gap's fix genuinely worked (verified, still true
 stopped occurring" was not the same claim as "the root cause is gone," and it took a third round of
 the operator asking a pointed technical question to get from one to the other.
 
+### Eighth gap: `ChargeSettlementStore` tracked only charge-level status, not per-VA status (2026-07-29, night)
+
+Raised while updating the blog write-up of the Seventh gap: the numbered description of
+`applyPayment`'s atomic transaction said "look up the charge, find all sibling VAs, mark them all
+paid" — but that is not what `payment-gateway`'s (RDBMS) reference behavior does, and not what a
+correct implementation should do. Only the VA that actually received the payment should become
+PAID; siblings that never received anything should become CANCELLED, exactly as
+`PaymentApplicationService.settleAndCancelSiblings` does in the RDBMS repo. Checking the actual
+`ChargeSettlementStore` code confirmed the gap was real, and deeper than wording: the store never
+tracked per-VA status at all, only a single charge-level status field, and `InquiryApplicationService`
+didn't check status of any kind — an inquiry against a VA belonging to an already-PAID or -CANCELLED
+charge still returned `SUCCESS` with the charge's `totalAmount`, contradicting CLAUDE.md's "a
+cancelled VA's next inquiry returns NOT_FOUND."
+
+**The fix**: VA records now carry their own `ACTIVE`/`PAID`/`CANCELLED` status, indexed under a new
+`va_by_charge:` prefix key so the settlement transaction can walk a charge's siblings without a
+full store scan. When a payment settles a charge (CLOSED, or an INSTALLMENT reaching its total), the
+same atomic transaction marks the paying VA `PAID` and every other still-`ACTIVE` sibling
+`CANCELLED` — mirroring `settleAndCancelSiblings` exactly. `InquiryApplicationService` now checks
+both the VA's own status and its charge's status, so a cancelled sibling (or the now-PAID VA itself)
+correctly returns `INVALID_VA` / HTTP 404 on its next inquiry.
+
+Caught and fixed a regression while wiring this up: `applyPayment`'s own VA lookup still assumed
+`registerVa`'s old raw-chargeId-string value format after VA records were switched to JSON — this
+broke every payment and inquiry call outright, surfaced immediately by the existing test suite
+(`BankCallbackControllerIntegrationTest`, `ConcurrentPaymentSettlementIntegrationTest`) going from
+all-passing to failing everywhere. Fixed by parsing the VA record's `chargeId` field instead of
+treating the raw bytes as the chargeId.
+
+**Verification**: a new integration test
+(`testPaymentCallback_ClosedChargeSettlement_PaidVaAndCancelledSiblingBothStopResolvingOnInquiry`)
+creates a CLOSED charge with two sibling VAs, settles it via one, then asserts both the paying VA
+and the untouched sibling return HTTP 404 on `/api/v1/inquiry` afterward. Confirmed live against a
+running instance under full benchmark load, not just the test suite, by inquiring a settled charge's
+VA directly: `{"status":"INVALID_VA","message":"Virtual account is no longer active (status
+PAID)"}`, HTTP 404.
+
+The full test suite (25 tests, including the 50-thread `ConcurrentPaymentSettlementIntegrationTest`)
+passed after the fix. The benchmark was re-run twice, fresh environment each time (the first attempt
+at the second run was contaminated by an unrelated project's Maven test suite running concurrently
+on the same machine, mid-run VU count briefly exceeding pre-allocation and p99 spiking to 70ms —
+discarded and re-run rather than reported, per this project's own standing rule about verifying the
+environment before trusting a number):
+
+| Metric | Run 1 (`vastatus1`) | Run 2 (`vastatus2`) | Seventh gap's runs (for comparison) |
+|---|---|---|---|
+| Run ID | `20260729181245` | `20260729201858` | `20260729162811` / `20260729163104` |
+| p99 latency | 9.19ms | 8.65ms | 9.96ms / 9.85ms |
+| Peak VUs (of 100 pre-allocated) | 46 | 31 | 32 / 33 |
+| Correctness audit | PASS, 0 mismatches (both checks) | PASS, 0 mismatches (both checks) | PASS, 0 mismatches |
+
+Statistically indistinguishable from the Seventh gap's own numbers — tracking per-VA status and
+walking siblings inside the transaction added real work (a prefix scan, a `getForUpdate`, and a
+JSON parse/serialize per sibling) but cost nothing measurable, because the benchmark's own seed data
+(`scenarios/suite-bsi.js`) only ever registers a single BSI sibling per charge. This benchmark
+therefore does not exercise the cost of cancelling multiple real siblings in one settlement — a
+multi-sibling pay-via-any-bank charge would walk more than one VA per settlement, and that path
+remains unmeasured here.
+
 ### Acceptance criteria for the re-benchmark
 
 1. [DONE] Both systems benchmarked through the same adapter protocol, same seed, same script, same
