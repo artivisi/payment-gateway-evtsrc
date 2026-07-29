@@ -463,6 +463,66 @@ a payment gateway that only shows up "sometimes, under load" is still a correctn
 gateway cannot have — production systems experience exactly that kind of contention (GC pauses, CPU
 spikes, slow disks) as a matter of course, not as an edge case to discount.
 
+### Seventh gap: the Sixth gap's fix was itself a downstream patch — the actual root cause was fixed by rearchitecting the write path (2026-07-29, evening)
+
+The Sixth gap's fix (`PostgresProjectionSink` retracting a contradicting row in place) stopped the
+observable symptom — the database record — from staying wrong. It did not, and structurally could
+not, fix the deeper problem: the request thread could still tell the bank "ACCEPTED" over HTTP
+*before* Kafka Streams' authoritative re-check ran, so a client-facing response could still disagree
+with the eventual truth even after that fix shipped. This was caught the same way the Sixth gap's own
+correction was — the operator asking a direct question ("we can work around it by doing several
+queries inside RocksDB instead of simply recording payment... all within a single RocksDB
+transaction") that turned out to describe the actually-correct fix.
+
+**Root cause, precisely stated**: the write path had two participants with a gap between them —
+`PaymentApplicationService` read RocksDB state on the request thread (read-only interactive query),
+then published an event; `PaymentGatewayStreamsTopology`'s `PaymentEventProcessor`, running on a
+separate Kafka Streams thread, was the actual authority that decided whether the payment counted.
+Whatever happened in that gap was invisible to the client, who had already been told the request
+thread's optimistic answer.
+
+**The fix**: `ChargeSettlementStore`, a RocksDB `TransactionDB` owned directly by the application —
+not by Kafka Streams. VA resolution, the charge terminal-status check, and the balance update now
+happen as one atomic transaction, on the request thread, using `getForUpdate` for the same row-lock
+semantics `SELECT FOR UPDATE` gives a relational transaction. There is no gap left for a second
+request to land in, and nothing left to re-decide later — whatever the transaction returns is what
+the bank is told, and it is already final. Kafka Streams' three state stores
+(`charge-state-store`, `va-registry-store`, `idempotency-store`) and `PaymentEventProcessor`'s
+decision logic were removed entirely once nothing read or wrote them anymore — keeping them as an
+unused mirror would have quietly recreated the exact "two places that can disagree" pattern this
+project keeps finding and fixing. Kafka is unchanged in one respect: it still broadcasts the
+now-already-decided outcome to `PostgresProjectionSink`'s read model.
+
+**Scale-out caveat, addressed rather than deferred**: a directly-owned local RocksDB store only
+gives this guarantee if requests for a given charge consistently reach the instance that owns it.
+The fix for that (not yet built, since this remains a single-instance deployment) is consistent
+partition keying — chargeId maps to the same partition a Kafka topic would use — plus Kafka
+Streams' own `queryMetadataForKey()` to route a request to the owning instance, exactly the pattern
+Kafka Streams' own documentation recommends for interactive queries. For genuine multi-site
+durability on top of that, replication factor 3 with `acks=all` and `min.insync.replicas=2` gives
+RPO=0 at the cost of write latency bound by inter-site RTT — the same physics tax synchronous
+multi-site RDBMS replication pays, not a Kafka-specific weakness.
+
+**Verification, two ways**:
+
+1. `ConcurrentPaymentSettlementIntegrationTest` fires 50 real concurrent threads at one
+   freshly-created `CLOSED` charge — no sequential event replay, no mocked timing. Exactly one
+   thread is accepted, the other 49 are correctly flagged, and `cumulativePaid` never double-counts.
+   This is a stronger proof than `PostgresProjectionSinkTest`'s sequential-event-replay test (which
+   proved the Sixth gap's symptom-level fix): it proves the race is closed under genuine thread
+   contention, not just that a specific event ordering is handled correctly.
+2. The full benchmark was re-run against the rearchitected build — two independent fresh runs, same
+   k6 scripts, same protocol. p99 came back at 9.96ms and 9.85ms (statistically indistinguishable
+   from the Fifth gap's clean numbers, 8.5–9.4ms), both audits passed with zero mismatches on both
+   checks, confirming the fix cost nothing in the metrics that matter and closed the correctness gap
+   at its source rather than downstream of it.
+
+A reminder that compounds on the last two: the Sixth gap's own text said "didn't reproduce under a
+clean environment is evidence of rarity, not unreality" — and that principle applied one level
+deeper than expected. The Sixth gap's fix genuinely worked (verified, still true), but "the symptom
+stopped occurring" was not the same claim as "the root cause is gone," and it took a third round of
+the operator asking a pointed technical question to get from one to the other.
+
 ### Acceptance criteria for the re-benchmark
 
 1. [DONE] Both systems benchmarked through the same adapter protocol, same seed, same script, same
