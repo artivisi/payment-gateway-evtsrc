@@ -66,9 +66,6 @@ class FinancialCorrectnessIntegrationTest extends AbstractIntegrationTest {
         assertThat(chargeResponse.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         String chargeId = chargeResponse.getBody().chargeId();
 
-        // Wait for the charge and both sibling VAs to hydrate into RocksDB before paying.
-        // charge-events and va-events are independently-lagging streams: the charge can report
-        // ACTIVE before either sibling VA is resolvable in va-registry-store.
         TestSupport.awaitChargeStatus(restTemplate, chargeId, "ACTIVE");
         TestSupport.awaitVaResolvable(restTemplate, "MAYBANK", vaMaybank);
         TestSupport.awaitVaResolvable(restTemplate, "BSI", vaBsi);

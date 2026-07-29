@@ -58,7 +58,7 @@ class BankCallbackControllerIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("REAL INTEGRATION: Payment callback for a VA resolved via va-registry-store returns ACCEPTED")
+    @DisplayName("REAL INTEGRATION: Payment callback for a registered VA returns ACCEPTED")
     void testPaymentCallback_Positive() {
         String vaNumber = "8801928371";
         createChargeAndAwaitHydration("MAYBANK", vaNumber, new BigDecimal("2500000.00"));
@@ -98,9 +98,6 @@ class BankCallbackControllerIntegrationTest extends AbstractIntegrationTest {
         assertThat(first.getBody().status()).isEqualTo(PaymentOutcome.ACCEPTED.name());
         String firstEventId = first.getBody().eventId();
 
-        // Wait for the topology (the only writer of idempotency-store) to actually apply the first
-        // payment before retrying with the same bankReference — a zero-delay repeat can race ahead
-        // of that async write and also come back ACCEPTED (see TestSupport.awaitCumulativePaidAtLeast).
         TestSupport.awaitCumulativePaidAtLeast(restTemplate, chargeId, request.amount());
 
         ResponseEntity<PaymentCallbackResponse> duplicate = postCallback(request);
@@ -139,9 +136,6 @@ class BankCallbackControllerIntegrationTest extends AbstractIntegrationTest {
         assertThat(settling.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(settling.getBody().status()).isEqualTo(PaymentOutcome.ACCEPTED.name());
 
-        // Wait for the topology (the authoritative serialization point) to mark the charge PAID
-        // before firing the raced payment, so this test exercises the pre-validation rejection
-        // path deterministically rather than the topology's own race-window rejection.
         TestSupport.awaitChargeStatus(restTemplate, chargeId, "PAID");
 
         String racedBankReference = "REF-" + UUID.randomUUID();
@@ -202,17 +196,17 @@ class BankCallbackControllerIntegrationTest extends AbstractIntegrationTest {
             executor.shutdown();
         }
 
-        // Source of truth: the topology's authoritative RocksDB state. Regardless of which layer
-        // (pre-validation or the topology's per-partition-key re-check) caught the race, the
-        // charge must settle exactly once — never double-counted.
+        // Source of truth: ChargeSettlementStore, via GET /api/v1/charges/{id}. Whichever of the
+        // two concurrent requests won the getForUpdate lock on this chargeId, the charge must
+        // settle exactly once -- never double-counted.
         TestSupport.awaitChargeStatus(restTemplate, chargeId, "PAID");
         ResponseEntity<String> finalCharge = restTemplate.getForEntity("/api/v1/charges/" + chargeId, String.class);
         assertThat(finalCharge.getStatusCode()).isEqualTo(HttpStatus.OK);
         BigDecimal cumulativePaid = extractCumulativePaid(finalCharge.getBody());
         assertThat(cumulativePaid).isEqualByComparingTo(totalAmount);
 
-        // The loser of the race must be observable somewhere as a flagged double settlement,
-        // whichever layer (pre-validation service or topology re-check) caught it.
+        // The loser of the race must be observable as a flagged double settlement in the
+        // Postgres projection, whichever of the two concurrent requests lost the getForUpdate lock.
         UUID chargeUuid = UUID.fromString(chargeId);
         Awaitility.await()
                 .atMost(Duration.ofSeconds(10))

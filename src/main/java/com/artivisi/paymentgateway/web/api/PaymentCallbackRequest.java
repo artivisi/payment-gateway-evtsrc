@@ -11,7 +11,7 @@ import java.time.Instant;
 /**
  * Generic / Maybank-shaped payment callback request.
  * The caller must NOT supply the charge id — the gateway resolves it from the
- * (bankCode, vaNumber) pair via the va-registry-store. A dedicated BSI controller
+ * (bankCode, vaNumber) pair via {@code ChargeSettlementStore}. A dedicated BSI controller
  * with its own DTO owns the BSI proprietary payload shape.
  */
 public record PaymentCallbackRequest(

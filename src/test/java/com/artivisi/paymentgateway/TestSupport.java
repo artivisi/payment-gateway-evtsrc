@@ -18,10 +18,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Shared polling helpers for integration tests.
  *
- * Kafka Streams hydration (charge-events / va-events / payment-events -> RocksDB state stores) is
- * asynchronous relative to the REST call that published the event. Tests that create a charge/VA
- * via POST and then rely on RocksDB-derived state (payment callback pre-validation, inquiry, the
- * charge GET endpoint) must poll for the expected state instead of asserting immediately.
+ * Charge/VA registration and payment settlement are all synchronous writes directly into
+ * {@code ChargeSettlementStore} now (see its own Javadoc) -- GET /api/v1/charges/{id} and
+ * POST /api/v1/inquiry read from that same store, so there is no hydration lag on this data path
+ * any more (an older design had Kafka Streams hydrating separate RocksDB state stores
+ * asynchronously; that's gone). These helpers are kept as defensive polling wrappers -- harmless
+ * (they succeed on the first attempt today) and cheaper than touching every call site to remove
+ * them -- rather than because anything here is still genuinely eventually-consistent.
  *
  * Reuse {@link #awaitChargeStatus} and {@link #awaitChargeVisible} rather than adding ad-hoc
  * Thread.sleep()/retry loops in new tests.
@@ -31,8 +34,8 @@ public final class TestSupport {
     private TestSupport() {}
 
     /**
-     * Polls GET /api/v1/charges/{chargeId} until the charge-state-store JSON reports the given
-     * "status" value (e.g. "ACTIVE", "PAID"), failing the test after the timeout elapses.
+     * Polls GET /api/v1/charges/{chargeId} until the JSON reports the given "status" value (e.g.
+     * "ACTIVE", "PAID"), failing the test after the timeout elapses.
      */
     public static void awaitChargeStatus(TestRestTemplate restTemplate, String chargeId, String expectedStatus) {
         Awaitility.await()
@@ -46,8 +49,8 @@ public final class TestSupport {
     }
 
     /**
-     * Polls GET /api/v1/charges/{chargeId} until the charge-state-store has hydrated at all
-     * (any status), for tests that only need the VA registered before firing a payment callback.
+     * Polls GET /api/v1/charges/{chargeId} until it responds at all (any status), for tests that
+     * only need the VA registered before firing a payment callback.
      */
     public static void awaitChargeVisible(TestRestTemplate restTemplate, String chargeId) {
         Awaitility.await()
@@ -60,26 +63,13 @@ public final class TestSupport {
     }
 
     /**
-     * Polls POST /api/v1/inquiry until the given (bankCode, vaNumber) resolves successfully.
-     *
-     * charge-events and va-events are two independently-lagging Kafka Streams consumer pipelines:
-     * the charge-state-store can report a charge "ACTIVE" (awaitChargeStatus) before va-registry-store
-     * has processed that charge's SiblingVaRegisteredEvent, or vice versa. A test that creates a
-     * charge+VA and immediately fires a payment callback must wait for BOTH stores, not just the
-     * charge's own status, or it will intermittently observe REJECTED_INVALID_VA on a VA that is
-     * genuinely registered moments later.
-     */
-    /**
      * Polls GET /api/v1/charges/{chargeId} until cumulativePaid reaches at least the given amount.
      *
-     * PaymentApplicationService's request-thread idempotency check reads idempotency-store, which
-     * is written asynchronously by the topology only after it consumes a PaymentReceivedEvent — not
-     * by pre-validation itself (interactive queries are read-only). A retry fired immediately after
-     * an ACCEPTED response can therefore race ahead of the topology and also come back ACCEPTED
-     * instead of DUPLICATE, even though the topology's own idempotency re-check guarantees the
-     * charge is never double-counted. Tests asserting DUPLICATE semantics must wait for the first
-     * payment to actually land (this method) before firing the repeat, matching how a real bank's
-     * retry-on-timeout behaves rather than a zero-delay repeat.
+     * Charge registration and payment settlement are both synchronous now (one atomic RocksDB
+     * transaction per payment against {@code ChargeSettlementStore} -- see its own Javadoc), so a
+     * retry fired immediately after an ACCEPTED response deterministically gets DUPLICATE; there is
+     * no async re-check to race ahead of any more. Kept for tests that want to assert on the
+     * settled amount specifically rather than just the immediate response.
      */
     public static void awaitCumulativePaidAtLeast(TestRestTemplate restTemplate, String chargeId, BigDecimal minCumulativePaid) {
         Pattern pattern = Pattern.compile("\"cumulativePaid\"\\s*:\\s*\"?(-?[0-9.]+)\"?");
@@ -96,6 +86,7 @@ public final class TestSupport {
                 });
     }
 
+    /** Polls POST /api/v1/inquiry until the given (bankCode, vaNumber) resolves successfully. */
     public static void awaitVaResolvable(TestRestTemplate restTemplate, String bankCode, String vaNumber) {
         Awaitility.await()
                 .atMost(Duration.ofSeconds(10))

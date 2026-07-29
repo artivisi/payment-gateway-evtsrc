@@ -225,9 +225,9 @@ public class PostgresProjectionSink {
             charge.setPaidAmount(newPaid);
             // OPEN is a standing/always-active account (e.g. a donation VA): it never reaches
             // FULLY_PAID regardless of how far cumulativePaid exceeds the nominal amount, matching
-            // PaymentGatewayStreamsTopology's RocksDB truth and payment-gateway's own
-            // applyOpen()/CLAUDE.md ("never auto-complete"). remainingAmount is left unclamped
-            // (can go negative) for OPEN, since it's informational only, not an enforced cap.
+            // ChargeSettlementStore's own truth and payment-gateway's own applyOpen()/CLAUDE.md
+            // ("never auto-complete"). remainingAmount is left unclamped (can go negative) for
+            // OPEN, since it's informational only, not an enforced cap.
             if ("OPEN".equals(charge.getChargeType())) {
                 charge.setRemainingAmount(newRemaining);
                 charge.setStatus("PARTIALLY_PAID");

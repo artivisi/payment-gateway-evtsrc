@@ -1,6 +1,6 @@
 # payment-gateway-evtsrc
 
-An event-sourced, self-hosted multi-bank Virtual Account (VA) payment gateway for Indonesian institutions, built on **Apache Kafka Streams**, **embedded RocksDB state stores**, and a **PostgreSQL 18 CQRS projection sink**.
+An event-sourced, self-hosted multi-bank Virtual Account (VA) payment gateway for Indonesian institutions. The synchronous write path is owned directly by the application — `ChargeSettlementStore`, a RocksDB `TransactionDB` — not by Kafka Streams. Apache Kafka is used as an event log purely for downstream fan-out: a PostgreSQL 18 CQRS read model and webhook delivery, neither of which the write path waits on to make a correctness decision.
 
 For local development and starter environments, this repository runs a **single-node deployment** (1 App Instance, 1 Apache Kafka broker, 1 PostgreSQL 18 container) to maintain **1:1 infrastructure parity** with the single-node deployment of the relational [`payment-gateway`](https://github.com/artivisi/payment-gateway) implementation for direct benchmark comparison.
 
@@ -8,14 +8,16 @@ For local development and starter environments, this repository runs a **single-
 
 ## 1. Problem & Architectural Motivation
 
-Institutions collecting payments via Virtual Accounts (universities, hospitals, foundations) require high availability, sub-millisecond callback validation, and single-debt guarantees across multiple bank VAs.
+Institutions collecting payments via Virtual Accounts (universities, hospitals, foundations) require high availability, low-latency callback validation, and single-debt guarantees across multiple bank VAs.
 
 The original [`payment-gateway`](https://github.com/artivisi/payment-gateway) project uses a traditional relational database (PostgreSQL 18) for write transactions and read queries. In high-volume payment bursts, database lock contention (`SELECT FOR UPDATE`), shared connection pools, and IO spikes can degrade bank callback SLAs.
 
-To evaluate a fully decoupled alternative, **`payment-gateway-evtsrc` implements a hybrid Event Sourcing & CQRS architecture**:
-1. **Kafka is the Source of Truth (Write Path)**: All domain actions (charge creation, VA allocation, payment callback, settlement) are appended as immutable events into Kafka.
-2. **RocksDB Hot-Path Validation**: Kafka Streams topologies maintain local, partitioned **RocksDB state stores** (`KTable`, `ReadOnlyKeyValueStore`) running directly inside the JVM process off-heap. Ingress bank callbacks validate idempotency and single-debt rules in $<1\text{ms}$ without touching an external database.
-3. **PostgreSQL 18 CQRS Reporting Sink (Read Path)**: An asynchronous projection sink streams events from Kafka into PostgreSQL 18. The Web UI fetches reporting data, transaction history, audit logs, and reconciliation status from PostgreSQL via **Spring Data JPA**.
+To evaluate a fully decoupled alternative, **`payment-gateway-evtsrc` implements an Event Sourcing & CQRS architecture**:
+1. **`ChargeSettlementStore` is the write-path source of truth**: charge creation, VA registration, and payment settlement each resolve, validate, and apply as one atomic RocksDB transaction (`getForUpdate`, the same row-lock semantics a relational `SELECT FOR UPDATE` gives) directly on the request thread. There is no separate, later authoritative re-check — whatever the transaction returns is already final by the time the bank gets a response.
+2. **Kafka is a fan-out log, not a decision point**: once a request-thread transaction has already decided the outcome, the resulting fact (`PaymentReceivedEvent`, `DoubleSettlementDetectedEvent`, etc.) is appended to Kafka so downstream consumers can react to it. Nothing reads these events back to make or revise a correctness decision.
+3. **PostgreSQL 18 CQRS Reporting Sink (Read Path)**: an asynchronous batch `@KafkaListener` (`PostgresProjectionSink`) streams events from Kafka into PostgreSQL 18. The Web UI fetches reporting data, transaction history, audit logs, and reconciliation status from PostgreSQL via **Spring Data JPA** — entirely decoupled from the write path.
+
+This is a correction of an earlier design (still visible in git history) where Kafka Streams owned three RocksDB state stores and the request thread only ran a read-only interactive query against them, then published an event for a separate Kafka Streams thread to apply later. That split left a race window: the request thread's optimistic read and the topology's later authoritative write could disagree, and by the time the topology caught the disagreement, the bank had already been told the request thread's — possibly wrong — answer. See `docs/benchmark-remediation-guideline.md`'s "Seventh gap" and "Eighth gap" for the incident this replaced, the fix, and how it was verified (a 50-real-thread concurrency test, not sequential event replay).
 
 ---
 
@@ -28,94 +30,96 @@ To evaluate a fully decoupled alternative, **`payment-gateway-evtsrc` implements
   - BSI (proprietary REST / JSON)
   - CIMB (proprietary SOAP / XML)
 - **VA Hosting Models**:
-  - **Gateway-hosted (Model 1)**: Gateway resolves VA inquiries in real time against its local RocksDB registry and receives payment callbacks.
+  - **Gateway-hosted (Model 1)**: Gateway resolves VA inquiries in real time against `ChargeSettlementStore` and receives payment callbacks.
   - **Bank-hosted (Model 2)**: Gateway registers VAs at banks upfront and handles payment callbacks.
 
 ### 2.2 Flexible Charge Types & Sibling Virtual Accounts
-- **Open Charges**: Persistent, variable amount, accepts repeated payments.
+- **Open Charges**: Persistent, variable amount, accepts repeated payments, never reaches a terminal state.
 - **Closed Charges**: Fixed amount, single payment, closes upon full settlement.
 - **Installment Charges**: Multiple partial payments accumulating up to a target debt amount.
 - **Sibling Virtual Accounts**: A single charge is payable through multiple bank VAs simultaneously.
 - **Single-Debt Invariant**:
-  - Payment on one bank sibling automatically updates charge balance in RocksDB and cancels/adjusts all sibling VAs.
-  - **Double-Settlement Discrepancy Prevention**: Concurrent payments at two banks trigger a `DoubleSettlementDetectedEvent` for out-of-band refund handling rather than silently double-crediting.
+  - The first payment that settles a CLOSED charge (or completes an INSTALLMENT charge) marks the paying VA `PAID` and every other still-`ACTIVE` sibling `CANCELLED`, inside the same atomic transaction that made the settlement decision.
+  - **Double-Settlement Discrepancy Prevention**: a payment against an already-settled charge is rejected and flagged (`DoubleSettlementDetectedEvent`) for out-of-band refund handling, never silently absorbed or double-credited.
 
-### 2.3 Kafka Streams & RocksDB State Engine (Hot Path)
-- **Kafka Event Topics**:
-  - `charge-events`: `ChargeCreated`, `ChargeCancelled`, `ChargeCompleted`
-  - `va-events`: `SiblingVaRegistered`, `SiblingVaStatusUpdated`
-  - `payment-events`: `PaymentReceived`, `DoubleSettlementDetected`
-  - `reconciliation-events`: `ReconciliationImported`, `DiscrepancyFlagged`
-  - `webhook-events`: `WebhookDispatched`, `WebhookFailed`
-- **Embedded RocksDB Stores**:
-  - `charge-state-store`: Partitioned RocksDB `KeyValueStore` holding charge metadata, active balance, and state.
-  - `va-registry-store`: High-speed RocksDB index mapping VA numbers to charge IDs for $<1\text{ms}$ lookup during bank callbacks.
-  - `idempotency-store`: Off-heap RocksDB index storing bank reference numbers to block duplicate callbacks locally.
+### 2.3 `ChargeSettlementStore`: RocksDB Write Path & Kafka Fan-Out
+- **`ChargeSettlementStore`**: a RocksDB `TransactionDB` owned directly by the application process — not a Kafka Streams state store, no changelog topic behind it. Its own key space is partitioned by prefix:
+  - `charge:<chargeId>` — charge metadata, `cumulativePaid`, and status (`ACTIVE` / `PAID` / `CANCELLED`).
+  - `va:<bankCode>_<vaNumber>` (plus a bank-agnostic `va:<vaNumber>` alias) — each VA's own `chargeId` and status. The VA that actually receives a settling payment becomes `PAID`; every other still-`ACTIVE` sibling becomes `CANCELLED`.
+  - `idem:<bankCode>_<bankReference>` — blocks duplicate callback processing.
+  - `va_by_charge:<chargeId>:<bankCode>_<vaNumber>` — an index letting a settlement transaction walk a charge's siblings without a full store scan.
+- **One atomic transaction per payment**: idempotency check, VA resolution, the charge's terminal-status check, the balance update, and (when the charge settles) the sibling walk all happen inside a single `getForUpdate`-locked RocksDB transaction on the request thread. See `ChargeSettlementStore`'s own Javadoc for the full mechanics and its stated scale-out caveat.
+- **Kafka event topics** (fan-out only — nothing reads these back to decide correctness):
+  - `charge-events`: `ChargeCreatedEvent`, `ChargeCancelledEvent`
+  - `va-events`: `SiblingVaRegisteredEvent`
+  - `payment-events`: `PaymentReceivedEvent`, `DoubleSettlementDetectedEvent`
+  - `reconciliation-events`, `webhook-events`: topics are provisioned (`KafkaTopicConfig`) but nothing currently publishes to them — reconciliation runs as a direct CSV-import call, and webhook delivery is driven off `payment-events` directly, not a dedicated `webhook-events` stream.
 
 ### 2.4 PostgreSQL 18 Projection Sink & Spring Data JPA (Read Path)
-- **Asynchronous Projection Sink**: Kafka consumer group processes domain events using idempotent batch upserts into PostgreSQL 18 reporting schema.
-- **Spring Data JPA Web UI**: Thymeleaf + HTMX operator dashboard queries PostgreSQL 18 via Spring Data JPA repositories for rich filtering, pagination, transaction search, and audit trails.
+- **Asynchronous Projection Sink**: a batch `@KafkaListener` (`PostgresProjectionSink`, consumer group `payment-gateway-projection-sink`) processes domain events into idempotent upserts against the PostgreSQL 18 reporting schema.
+- **Spring Data JPA Web UI**: Thymeleaf + HTMX operator dashboard queries PostgreSQL 18 via Spring Data JPA repositories for filtering, pagination, transaction search, and audit trails.
 
 ### 2.5 Reconciliation & Discrepancy Management
-- End-of-Day (EOD) bank settlement CSV import processor.
-- Stateful cross-check matching against recorded payment events in PostgreSQL and RocksDB.
-- Automated flagging of unmatched credits, duplicate payments, and amount mismatches.
+- End-of-Day (EOD) bank settlement CSV import processor (`ReconciliationProcessor`), invoked directly, not Kafka-driven.
+- Cross-checks recorded payments in PostgreSQL against the imported settlement file.
+- Flags unmatched credits, duplicate payments, and amount mismatches.
 
 ### 2.6 Resilient Webhook Delivery
-- Asynchronous worker consuming `payment-events` to deliver signed webhooks to client applications.
+- `WebhookDispatcherWorker`, an asynchronous `@KafkaListener` (consumer group `payment-gateway-webhook-dispatcher`) on `payment-events`, delivers signed webhooks to client applications.
 - Exponential backoff retries with per-consumer isolation.
 
 ---
 
 ## 3. Architecture Design
 
-### 3.1 Paradigm Shift: Kafka Streams + RocksDB vs. Traditional RDBMS
+### 3.1 Where State Actually Lives, vs. a Traditional RDBMS
 
-To understand why this project uses an Event Sourcing & CQRS pattern, it is helpful to contrast how state and processing responsibilities are divided in Kafka Streams + RocksDB versus a traditional RDBMS:
-
-| Dimension | Application Node (`streams-engine`) | Kafka Broker Cluster | Traditional RDBMS (`payment-gateway`) |
+| Dimension | This App's Write Path (`ChargeSettlementStore`) | Kafka Broker Cluster | Traditional RDBMS (`payment-gateway`) |
 |---|---|---|---|
-| **What Runs Here?** | Spring Boot JVM + Embedded RocksDB C++ Library (`rocksdbjni`). | Apache Kafka Broker Daemon (KRaft). | Monolithic Spring Boot App + PostgreSQL 18. |
-| **Where is State Stored?** | **Local Disk / SSD** of the App container (`/var/data/rocksdb`). | **Kafka Segment Logs** on Broker Disk. | **PostgreSQL Data Tables** on DB Disk. |
-| **Primary Purpose** | **Sub-millisecond Local Key Lookups** ($<1\text{ms}$) during hot-path callbacks. | **Immutable Event Store**, Streaming, & **Changelog Backup**. | **ACID Transactions**, State Storage, & Read Queries (Shared DB). |
-| **Network Hop on Callback** | **Zero Network Hop** (Local RAM / SSD). | **1 Async Append Hop** to Kafka Event Store. | **1–4 Network Hops** (RDBMS SQL Round-Trips). |
-| **What Happens on App Crash?** | App container restarts & re-hydrates RocksDB from Kafka **Changelog Topic**. | Unaffected. Keeps serving topics & changelogs. | Application restarts; DB remains single point of failure if unclustered. |
+| **What runs here?** | Spring Boot JVM + embedded RocksDB C++ library (`rocksdbjni`), owned directly by the app — no Kafka Streams. | Apache Kafka broker daemon (KRaft). | Monolithic Spring Boot app + PostgreSQL 18. |
+| **Where is state stored?** | Local disk of the app container (`app.settlement-store.dir`). | Kafka segment logs on broker disk. | PostgreSQL data tables on DB disk. |
+| **Primary purpose** | Atomic decision-making for the write path: idempotency, VA resolution, charge status, balance, sibling settlement. | Immutable event log for downstream fan-out (Postgres projection, webhooks). | ACID transactions, state storage, and read queries (shared DB). |
+| **Network hop on callback** | Zero — the decision is made against the local RocksDB directory. | One append, blocked on for the broker ack, but *after* the decision is already final. | 1–4 network round-trips (RDBMS SQL statements inside one transaction). |
+| **What happens on app crash?** | If `app.settlement-store.dir` is a persistent volume, the directory survives a restart intact. If it isn't, the store comes back empty; `PostgresInitialStateSeeder` can re-seed from the Postgres projection, but anything created or paid after the last projection would be lost from the write-path store specifically. There is currently **no automatic changelog-backed recovery** — see §4.4. | Unaffected; keeps serving topics. | App restarts; DB remains the single point of failure if unclustered. |
 
 ---
 
 ### 3.2 Storage Strategy & Location (Where Everything Resides)
 
-| Store Name / Component | Storage Engine | Purpose & Access Pattern |
+| Store / Component | Storage Engine | Purpose & Access Pattern |
 |---|---|---|
-| **Event Store (Write)** | Apache Kafka | Immutable source of truth log for all domain events. |
-| **`charge-state-store`** | RocksDB (`KeyValueStore`) | Holds aggregate charge lifecycle state, payment history, and balance indexed by `charge_id`. |
-| **`va-registry-store`** | RocksDB (`KeyValueStore`) | Maps VA numbers (`bank_code + va_number`) to `charge_id` for $<1\text{ms}$ lookup during bank callbacks. |
-| **`idempotency-store`** | RocksDB (`KeyValueStore`) | Tracks bank payment transaction reference IDs off-heap to prevent duplicate callback processing locally. |
-| **Reporting Read DB** | **PostgreSQL 18** | CQRS projection sink storing relational read models for the Web UI, accessed via **Spring Data JPA**. |
+| **Event log (fan-out)** | Apache Kafka | Immutable record of already-decided facts, for the Postgres projection and webhook delivery. |
+| **`ChargeSettlementStore`** | RocksDB `TransactionDB` (`rocksdbjni`) | The write path's actual source of truth — charge, VA, idempotency, and sibling-index records, all in one directly-owned store (see §2.3's key layout). |
+| **Reporting Read DB** | PostgreSQL 18 | CQRS projection sink storing relational read models for the Web UI, accessed via Spring Data JPA. |
 
 ```mermaid
 flowchart TD
     subgraph App_Server ["Application Server / Container (Spring Boot JVM)"]
-        KSTREAM["Kafka Streams Topology (JVM)"]
-        subgraph Local_Storage ["Local Disk & Off-Heap Memory"]
-            ROCKS[("Embedded RocksDB State Stores<br/>(/var/data/rocksdb)")]
+        SVC["Request-thread services<br/>(PaymentApplicationService, ChargeApplicationService,<br/>InquiryApplicationService)"]
+        subgraph Local_Storage ["Local Disk (app.settlement-store.dir)"]
+            ROCKS[("ChargeSettlementStore<br/>RocksDB TransactionDB<br/>charge: / va: / idem: / va_by_charge: keys")]
         end
-        KSTREAM -->|"Embedded JNI Writes (<1ms)"| ROCKS
+        SVC -->|"1. Atomic getForUpdate transaction<br/>(the decision is made here)"| ROCKS
     end
 
     subgraph Kafka_Cluster ["Kafka Broker Cluster"]
-        TOPICS["Domain Event Topics<br/>(charge-events, payment-events)"]
-        CHANGELOGS["State Store Changelog Topics<br/>(Backup & Recovery Log)"]
+        TOPICS["Domain Event Topics<br/>(charge-events, va-events, payment-events)"]
     end
 
-    KSTREAM -->|1. Appends Domain Event| TOPICS
-    KSTREAM -.->|2. Async Changelog Stream| CHANGELOGS
+    subgraph Consumers ["Async Consumers (react, never decide)"]
+        SINK["PostgresProjectionSink<br/>(batch listener)"]
+        WEBHOOK["WebhookDispatcherWorker"]
+    end
+
+    SVC -->|"2. Publish the already-decided fact<br/>(blocks on the broker ack, but after the decision)"| TOPICS
+    TOPICS --> SINK
+    TOPICS --> WEBHOOK
 ```
 
-#### Key Storage Principles:
-- **RocksDB Resides on the Application Node**: RocksDB runs **inside the JVM process of the Spring Boot application instance via JNI**, persisting data files to the local disk/SSD of the application container (`/var/data/rocksdb`). The Kafka Broker does **not** host or run RocksDB.
-- **Zero Network Hop in Hot Path**: Hot-path lookups (idempotency, VA resolution) access local RAM/SSD in **$<1\text{ms}$** without calling an external DB or broker over the network.
-- **Broker-Side Backup & Recovery**: Every state mutation written to local RocksDB is automatically streamed to a hidden Kafka **Changelog Topic** on the broker. If an app container crashes or moves, a new container re-hydrates its local RocksDB store automatically from Kafka.
+#### Key Storage Principles
+- **`ChargeSettlementStore` resides on the application node**: RocksDB runs inside the JVM process via JNI, persisting to the local disk of the app container. Kafka does not host or run it, and there is no Kafka Streams changelog topic backing it.
+- **The decision is made locally, before Kafka is touched**: idempotency, VA resolution, charge status, balance update, and sibling settlement all happen in one `getForUpdate` transaction against the local directory. Kafka is only appended to afterward, to broadcast that already-final decision.
+- **No changelog-backed recovery today**: durability of `ChargeSettlementStore` depends entirely on `app.settlement-store.dir` being a persistent, backed-up volume — see §4.4 for what this means for HA.
 
 ---
 
@@ -123,41 +127,35 @@ flowchart TD
 
 #### 1. Event-Sourced & CQRS Architecture Flow (`payment-gateway-evtsrc`)
 
-The hot path completes synchronously in **$<1\text{ms}$** upon writing to Kafka. State processing in RocksDB and relational projections in PostgreSQL 18 execute asynchronously in parallel.
+The decision is made synchronously against the local RocksDB transaction; Kafka is appended to afterward purely to broadcast it, and PostgreSQL projection happens asynchronously in parallel with nothing else.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Client as Client / Bank
-    participant API as Ingress Gateway
-    participant CMD as Command Engine
-    participant Kafka as Kafka Event Store
-    participant KStream as Kafka Streams (RocksDB)
+    participant API as Ingress Controller
+    participant Store as ChargeSettlementStore<br/>(RocksDB TransactionDB)
+    participant Kafka as Kafka Event Log
     participant Sink as Postgres Projection Sink
     participant PG as PostgreSQL 18 DB
     actor Operator as Web UI Operator
 
     %% Write Path (Synchronous Hot Path)
     rect rgb(235, 245, 255)
-    note right of Client: 1. Synchronous Write / Command Path (Hot Path)
+    note right of Client: 1. Synchronous Write Path -- decision made here, nowhere else
     Client->>API: POST /api/v1/payments (Callback / Command)
-    API->>CMD: Validate Idempotency & Invariants
-    CMD->>Kafka: Append PaymentReceivedEvent
-    Kafka-->>CMD: ACK Event Appended
-    CMD-->>API: Command Accepted
-    API-->>Client: HTTP 200 OK / 201 Created (<1ms Response)
+    API->>Store: Atomic transaction: idempotency, VA, charge status,<br/>balance, sibling settlement (getForUpdate)
+    Store-->>API: Final outcome (ACCEPTED / DUPLICATE / REJECTED_*)
+    API->>Kafka: Append the already-decided fact, block for broker ack
+    Kafka-->>API: ACK
+    API-->>Client: HTTP response (outcome was already final before this ACK)
     end
 
     %% Asynchronous Processing & Projection Path
     rect rgb(240, 255, 240)
-    note right of Kafka: 2. Asynchronous Hot-Path & CQRS Projection Path
-    par Hot-Path State Update
-        Kafka-->>KStream: Stream PaymentReceivedEvent
-        KStream->>KStream: Update Charge Balance & Sibling VAs (RocksDB)
-    and Asynchronous CQRS Projection
-        Kafka-->>Sink: Stream PaymentReceivedEvent
-        Sink->>PG: Batch Upsert Read Models (Spring Data JPA)
-    end
+    note right of Kafka: 2. Asynchronous fan-out -- reacts, never re-decides
+    Kafka-->>Sink: Stream the event (batch @KafkaListener)
+    Sink->>PG: Idempotent upsert into read models (Spring Data JPA)
     end
 
     %% Read Path
@@ -170,7 +168,7 @@ sequenceDiagram
 
 #### 2. Traditional RDBMS Architecture Flow (Original `payment-gateway`)
 
-In the original relational implementation, the bank callback thread must execute multiple sequential database queries and writes inside a single blocking ACID transaction before responding to the bank.
+In the relational implementation, the bank callback thread executes multiple sequential database queries and writes inside a single blocking ACID transaction before responding to the bank.
 
 ```mermaid
 sequenceDiagram
@@ -193,7 +191,7 @@ sequenceDiagram
     API->>PG: INSERT INTO payment (...)
     API->>PG: COMMIT TRANSACTION
     PG-->>API: Transaction Committed
-    API-->>Client: HTTP 200 OK (5–50ms Dependent on DB Load)
+    API-->>Client: HTTP 200 OK
     end
 
     %% Read Path (Shares DB IO and Connection Pool)
@@ -208,10 +206,10 @@ sequenceDiagram
 
 | Metric / Dimension | Traditional RDBMS (`payment-gateway`) | Event-Sourced CQRS (`payment-gateway-evtsrc`) |
 |---|---|---|
-| **Hot-Path Response Time** | $5\text{–}50\text{ ms}$ (blocking DB transaction) | **$<1\text{ ms}$** (instant Kafka event append) |
-| **Write-Read Coupling** | Shared DB connections & IO contention | **Fully Decoupled** (Writes hit Kafka/RocksDB; Reads hit Postgres) |
-| **Resilience to DB Downtime** | Bank callbacks **fail** if Postgres is down | Bank callbacks **succeed**; Postgres sink catches up asynchronously |
-| **Auditability & Replay** | Destructive state updates (`UPDATE`) | **100% Replayable** from Kafka event log genesis |
+| **Hot-path response time** | Low-single-digit ms typically; degrades under sustained hot-row contention (see §5's linked report for a measured knee). | Low-single-digit ms median, single-digit-ms p99, no degradation observed at the same load — measured, not aspirational; see §5. Neither system is sub-millisecond end-to-end once checksum verification and the network round-trip are counted. |
+| **Write-read coupling** | Shared DB connections & IO contention. | Decoupled: writes hit local RocksDB; reads hit Postgres, fed asynchronously. |
+| **Resilience to DB downtime** | Bank callbacks fail if Postgres is down. | Bank callbacks still succeed (the decision never touches Postgres); the Postgres read model falls behind and catches up once it's back. |
+| **Auditability & replay** | Destructive state updates (`UPDATE`). | Kafka event replay fully rebuilds the **Postgres read model** from genesis (§4.5) — it does **not** rebuild `ChargeSettlementStore` itself, since that store has no changelog behind it (see §3.1, §4.4). |
 
 ---
 
@@ -219,7 +217,7 @@ sequenceDiagram
 
 #### 1. Event-Sourced CQRS System Architecture (`payment-gateway-evtsrc`)
 
-Decoupled event streaming architecture where Kafka is the source of truth, RocksDB provides off-heap $<1\text{ms}$ hot-path validation, and PostgreSQL 18 serves as an asynchronous CQRS reporting sink.
+`ChargeSettlementStore` is where every write-path decision is made, synchronously, on the request thread. Kafka fans the already-decided fact out to the Postgres projection sink and the webhook dispatcher; neither is on the decision path.
 
 ```mermaid
 flowchart TD
@@ -230,62 +228,54 @@ flowchart TD
         B3[CIMB<br/>SOAP / XML]
     end
 
-    subgraph Ingress Gateway & Command Handler
+    subgraph Ingress ["Ingress Controllers & Application Services"]
         API[Unified REST API<br/>Create Charge & Sibling VAs]
-        CALLBACK[Bank Callback Controller<br/>Inquiry & Payment Hooks]
-        VALIDATOR[Command Validator & State Machine<br/>Idempotency & Invariant Rules]
+        CALLBACK[Bank Callback Controllers<br/>Inquiry & Payment Hooks]
+        SVC[ChargeApplicationService / PaymentApplicationService /<br/>InquiryApplicationService]
     end
 
-    subgraph Event Store
-        KAFKA[ Apache Kafka Cluster <br/>Immutable Source of Truth Event Log]
+    subgraph Settlement ["Synchronous Write Path (App Instance, JVM Process)"]
+        STORE[("ChargeSettlementStore<br/>RocksDB TransactionDB -- one atomic<br/>transaction decides the outcome")]
     end
 
-    subgraph Kafka Streams & Hot-Path Engine
-        subgraph App_Node ["App Instance (JVM Process)"]
-            KSTREAM_ENGINE[Kafka Streams Processor Topology]
-            subgraph RocksDB_Stores ["Embedded RocksDB State Stores (Off-Heap / Disk)"]
-                RDB_CHARGE[(charge-state-store)]
-                RDB_VA[(va-registry-store)]
-                RDB_IDEM[(idempotency-store)]
-            end
-        end
+    subgraph Event_Log ["Kafka: Fan-Out Only"]
+        KAFKA[Apache Kafka Cluster<br/>Already-decided facts]
     end
 
-    subgraph CQRS Projection Sink & Workers
-        PROJ_SINK[PostgreSQL Projection Sink<br/>Kafka Event Consumer Group]
-        WH_WORKER[Webhook Dispatcher Worker<br/>Asynchronous Event Delivery]
-        RECON_ENGINE[Reconciliation Engine<br/>CSV Importer & Discrepancy Checker]
+    subgraph Async_Consumers ["Asynchronous Consumers (react, never decide)"]
+        PROJ_SINK[PostgresProjectionSink<br/>batch @KafkaListener]
+        WH_WORKER[WebhookDispatcherWorker<br/>@KafkaListener on payment-events]
+        RECON_ENGINE[ReconciliationProcessor<br/>direct CSV import, not Kafka-driven]
     end
 
-    subgraph Read Models & Persistence
+    subgraph Read_Models ["Read Models & Persistence"]
         PG[(PostgreSQL 18<br/>Reporting Read DB)]
         ADMIN[Web Admin UI & Reporting<br/>Thymeleaf / HTMX + Spring Data JPA]
     end
 
-    %% Relationships
     CLIENT -->|1. Create Charge Request| API
     B1 -->|2. Inquiry / Payment Callback| CALLBACK
     B2 -->|2. Inquiry / Payment Callback| CALLBACK
     B3 -->|2. Inquiry / Payment Callback| CALLBACK
 
-    API -->|3. Submit Command| VALIDATOR
-    CALLBACK -->|3. Submit Callback Command| VALIDATOR
+    API --> SVC
+    CALLBACK --> SVC
 
-    VALIDATOR -->|4. Append Domain Events| KAFKA
+    SVC -->|3. Atomic transaction -- outcome decided here| STORE
+    STORE -->|4. Final outcome| SVC
+    SVC -->|5. HTTP response, already final| CALLBACK
 
-    KAFKA -->|5. Stream Domain Events| KSTREAM_ENGINE
-    KSTREAM_ENGINE -->|6. Maintain Local Key-Value State| RocksDB_Stores
+    SVC -->|6. Publish already-decided fact| KAFKA
 
-    KAFKA -->|7. Stream Events to Projection Sink| PROJ_SINK
-    PROJ_SINK -->|8. Idempotent Upsert| PG
+    KAFKA -->|7. Stream events| PROJ_SINK
+    PROJ_SINK -->|8. Idempotent upsert| PG
 
-    KAFKA -->|Stream Payment Events| WH_WORKER
-    WH_WORKER -->|9. Deliver Webhook| CLIENT
+    KAFKA -->|Stream payment-events| WH_WORKER
+    WH_WORKER -->|9. Deliver webhook| CLIENT
 
-    RECON_ENGINE -->|Upload EOD CSV & Match| PG
-    RECON_ENGINE -->|Emit Recon Events| KAFKA
+    RECON_ENGINE -->|Upload EOD CSV & match| PG
 
-    ADMIN -->|10. Spring Data JPA Queries| PG
+    ADMIN -->|10. Spring Data JPA queries| PG
 ```
 
 #### 2. Traditional RDBMS System Architecture (Original `payment-gateway`)
@@ -307,7 +297,6 @@ flowchart TD
         PG[(PostgreSQL 18 Database<br/>Synchronous CRUD & ACID Transactions)]
     end
 
-    %% Relationships
     CLIENT -->|1. Create Charge| API
     B1 -->|2. Inquiry / Payment Callback| CALLBACK
     B2 -->|2. Inquiry / Payment Callback| CALLBACK
@@ -327,9 +316,9 @@ flowchart TD
 
 ### 3.5 Synchronous HTTP Protocol Adapters & Hot-Path Pre-Validation
 
-Indonesian banking protocols (Maybank SNAP, BSI, CIMB) mandate **strict synchronous HTTP responses**. The gateway must never return an intermediate "pending" state to the bank. This section describes the pre-validation actually implemented in `PaymentApplicationService.processPayment` / `InquiryApplicationService.inquireAccount`, executed on the HTTP request thread as interactive queries against the Kafka Streams RocksDB state stores — not a design aspiration.
+Indonesian banking protocols (Maybank SNAP, BSI, CIMB) mandate **strict synchronous HTTP responses**. The gateway must never return an intermediate "pending" state to the bank. This section describes the validation actually implemented in `PaymentApplicationService.processPayment` / `InquiryApplicationService.inquireAccount` / `ChargeSettlementStore.applyPayment`, executed as one atomic RocksDB transaction on the HTTP request thread — not a design aspiration.
 
-1. **Account Inquiry** (`POST /api/v1/inquiry`, `/api/inquiry`, `/api/bank/maybank/v1.0/transfer-va/inquiry`): responds **`HTTP 200 OK`** with customer name and outstanding amount on a resolved VA, or **`HTTP 404`** (`INVALID_VA` / `INVALID_CHARGE`) on an unresolved one.
+1. **Account Inquiry** (`POST /api/v1/inquiry`, `/api/inquiry`, `/api/bank/maybank/v1.0/transfer-va/inquiry`): responds **`HTTP 200 OK`** with customer name and outstanding amount if the VA resolves, its own status is `ACTIVE`, *and* its charge's status is `ACTIVE`; **`HTTP 404`** (`INVALID_VA` / `INVALID_CHARGE`) otherwise — including a settled VA (paid or cancelled), which correctly stops resolving once its charge settles.
 2. **Payment Callback** (`POST /api/v1/payments`, `/api/payments`, `/api/bank/maybank/v1.0/transfer-va/payment`; BSI's proprietary shape is served separately at `/api/bank/bsi`, see below): the outcome vocabulary is the `PaymentOutcome` enum (`ACCEPTED`, `DUPLICATE`, `REJECTED_INVALID_VA`, `REJECTED_CHARGE_CLOSED`, `REJECTED_INVALID_AMOUNT`, `REJECTED_INVALID_REQUEST`), mapped to HTTP status by `BankCallbackController`:
    - `ACCEPTED`, `DUPLICATE` → `200 OK`
    - `REJECTED_INVALID_VA` → `404 Not Found`
@@ -344,15 +333,11 @@ flowchart TD
 
     subgraph App_Instance ["Application Server (JVM Process)"]
         CTRL[Protocol Ingress Controller]
-        subgraph Local_RocksDB ["Local RocksDB, interactive query on the request thread"]
-            VA_STORE[("va-registry-store")]
-            CHG_STORE[("charge-state-store")]
-            IDEM_STORE[("idempotency-store")]
-        end
+        STORE[("ChargeSettlementStore<br/>one atomic getForUpdate transaction<br/>per payment, on the request thread")]
         PROD[Kafka Producer]
     end
 
-    subgraph Async_Engine ["Asynchronous Event Core & Sinks"]
+    subgraph Async_Engine ["Asynchronous Consumers (react only, after the fact)"]
         KAFKA[(Kafka Topic: payment-events)]
         WEBHOOK[Webhook Dispatcher]
         PG[(PostgreSQL 18 Read DB)]
@@ -360,43 +345,41 @@ flowchart TD
 
     %% INQUIRY FLOW
     INQ_REQ -->|"a. Sync HTTP POST"| CTRL
-    CTRL -->|"b. Lookup VA & charge"| Local_RocksDB
-    CTRL -->|"c1. Resolved -> HTTP 200 OK"| INQ_REQ
-    CTRL -->|"c2. Not found -> HTTP 404 INVALID_VA"| INQ_REQ
+    CTRL -->|"b. Resolve VA + charge, check both statuses"| STORE
+    CTRL -->|"c1. Both ACTIVE -> HTTP 200 OK"| INQ_REQ
+    CTRL -->|"c2. VA/charge not found or settled -> HTTP 404 INVALID_VA"| INQ_REQ
 
     %% PAYMENT FLOW
     PAY_REQ -->|"a. Sync HTTP POST"| CTRL
-    CTRL -->|"b. Idempotency, VA, charge-status checks, in order"| Local_RocksDB
+    CTRL -->|"b. Idempotency, VA, charge-status, balance, sibling settlement -- one transaction"| STORE
 
     CTRL -->|"c1. Malformed request -> HTTP 400 REJECTED_INVALID_REQUEST"| PAY_REQ
     CTRL -->|"c2. Duplicate bankReference -> HTTP 200 DUPLICATE"| PAY_REQ
     CTRL -->|"c3. Unknown VA -> HTTP 404 REJECTED_INVALID_VA"| PAY_REQ
-    CTRL -->|"c4. Charge already PAID -> HTTP 400 REJECTED_CHARGE_CLOSED"| PAY_REQ
-    CTRL -->|"c5. Passed all checks -> Append PaymentReceivedEvent, block for the send ack"| PROD
+    CTRL -->|"c4. Charge already settled -> HTTP 400 REJECTED_CHARGE_CLOSED,<br/>flagged as DoubleSettlementDetectedEvent"| PAY_REQ
+    CTRL -->|"c5. Settled -- append the already-decided fact, block for the send ack"| PROD
     PROD --> KAFKA
-    CTRL -->|"c6. HTTP 200 ACCEPTED"| PAY_REQ
+    CTRL -->|"c6. HTTP 200 ACCEPTED (outcome was already final before c5)"| PAY_REQ
 
     %% ASYNC FANOUT
     KAFKA -.-> WEBHOOK
     KAFKA -.-> PG
 ```
 
-#### Detailed Execution Mechanics:
+#### Detailed Execution Mechanics
 
-1. **Account Inquiry**: the controller looks up `bankCode_vaNumber` in `va-registry-store`, then the resolved `chargeId` in `charge-state-store`, and returns `200 OK` with the current outstanding amount, or `404` if either lookup misses.
+1. **Account Inquiry**: `InquiryApplicationService.inquireAccount` resolves `bankCode_vaNumber` via `ChargeSettlementStore.resolveVa`, rejecting (`404 INVALID_VA`) if the VA doesn't resolve or its own status isn't `ACTIVE`; otherwise loads the charge and rejects (`404 INVALID_VA`) if the charge's own status isn't `ACTIVE` either; otherwise returns `200 OK` with the outstanding amount.
 
-2. **Payment Callback Pre-Validation** (`PaymentApplicationService.processPayment`, in this exact order — each step short-circuits the rest):
-   1. **Field validation**: `bankCode`, `vaNumber`, `bankReference` non-blank, `amount` present and `> 0`, `paymentTimestamp` present. Any violation → `REJECTED_INVALID_REQUEST` (`400`). No field is defaulted or substituted — a missing `paymentTimestamp` is rejected, never set to `now()`.
-   2. **Idempotency**: look up `bankCode + "_" + bankReference` in `idempotency-store`. A hit returns `DUPLICATE` (`200`) with the originally recorded `eventId`/`chargeId` — no second event is appended.
-   3. **VA resolution**: look up `bankCode + "_" + vaNumber` in `va-registry-store`. A miss returns `REJECTED_INVALID_VA` (`404`). The caller does not supply `chargeId` — the gateway resolves it from the VA.
-   4. **Charge terminal-status check**: load the resolved charge from `charge-state-store`. If its status is `PAID`, the payment is rejected as `REJECTED_CHARGE_CLOSED` (`400`) **and** a `DoubleSettlementDetectedEvent` is appended to `payment-events` immediately, flagging the attempted overpayment rather than silently dropping it.
-   5. Otherwise, a `PaymentReceivedEvent` is appended to `payment-events` via `kafkaTemplate.send(...).get()` (the request blocks for the broker ack) and `ACCEPTED` (`200`) is returned.
+2. **Payment Callback Pre-Validation** (`PaymentApplicationService.processPayment` → `ChargeSettlementStore.applyPayment`, all of steps (b)–(e) below inside **one** RocksDB transaction, in this exact order — each step short-circuits the rest):
+   1. **Field validation** (before the transaction): `bankCode`, `vaNumber`, `bankReference` non-blank, `amount` present and `> 0`, `paymentTimestamp` present. Any violation → `REJECTED_INVALID_REQUEST` (`400`). No field is defaulted or substituted — a missing `paymentTimestamp` is rejected, never set to `now()`.
+   2. **Idempotency**: `getForUpdate` on `idem:<bankCode>_<bankReference>`. A hit returns `DUPLICATE` (`200`) with the originally recorded `eventId`/`chargeId` — no second event is appended, and the transaction rolls back.
+   3. **VA resolution**: plain read of `va:<bankCode>_<vaNumber>` (or the bank-agnostic alias). A miss returns `REJECTED_INVALID_VA` (`404`). The caller does not supply `chargeId` — the gateway resolves it from the VA record.
+   4. **Charge terminal-status check**: `getForUpdate` on `charge:<chargeId>` — this is the row lock: no other transaction touching this same `chargeId` can proceed until this one commits or rolls back. If the charge's status is already `PAID` or `CANCELLED`, the payment is rejected as `REJECTED_CHARGE_CLOSED` (`400`) **and** a `DoubleSettlementDetectedEvent` is recorded in the same transaction, flagging the attempted overpayment rather than silently dropping it.
+   5. Otherwise, `cumulativePaid` is updated; if this payment settles the charge (CLOSED, or an INSTALLMENT reaching its total), the charge is marked `PAID` and the sibling walk runs (§2.3) in the same transaction; the transaction commits and `ACCEPTED` (`200`) is returned.
 
-   **Not implemented**: `REJECTED_INVALID_AMOUNT` is declared in the outcome enum and already wired to `400` in both callback controllers, but no code path currently produces it. Per-charge-type amount validation (CLOSED payment must equal the remaining balance; INSTALLMENT must not exceed it) described as a target in earlier design notes does not exist yet — the only amount check on the request thread is the `> 0` field check above.
+3. **No residual race for a single instance**: unlike the earlier Kafka-Streams-based design, there is no gap left between "checked" and "applied" for a second request to land in — the entire lookup-validate-apply sequence is one `getForUpdate`-locked transaction, so two concurrent callbacks against the *same* `chargeId` are fully serialized by RocksDB itself, not by a later asynchronous re-check. Verified two ways: `BankCallbackControllerIntegrationTest.testPaymentCallback_ConcurrentFullSettlement_ExactlyOneApplied` (an HTTP-level concurrent-settlement test) and `ConcurrentPaymentSettlementIntegrationTest` (50 real concurrent threads against one freshly-created `CLOSED` charge — exactly one accepted, the other 49 correctly flagged, `cumulativePaid` never double-counted). The one caveat this *doesn't* cover: multiple **instances** each running their own local `ChargeSettlementStore` — see §4.4.
 
-3. **Residual race, and where it's actually closed**: this pre-validation runs on the request thread and is **not** the authoritative serialization point — two concurrent callbacks against the same charge can both pass step 4 before either `PaymentReceivedEvent` is applied. `PaymentEventProcessor` in `PaymentGatewayStreamsTopology` (the single writer per `chargeId` partition key) re-checks idempotency and the charge's terminal status before applying `cumulativePaid`, and emits its own `DoubleSettlementDetectedEvent` instead of applying an overpayment if that race actually occurred. A concurrent-settlement test (`BankCallbackControllerIntegrationTest.testPaymentCallback_ConcurrentFullSettlement_ExactlyOneApplied`) exercises this end to end.
-
-4. **Asynchronous fan-out**: after the bank receives its synchronous response, `WebhookDispatcherWorker` and `PostgresProjectionSink` consume `payment-events` (and the other domain topics) independently to deliver client webhooks and update the PostgreSQL read model. Neither is on the request path.
+4. **Asynchronous fan-out**: after the bank receives its synchronous response, `WebhookDispatcherWorker` and `PostgresProjectionSink` consume `payment-events` (and the other domain topics) independently to deliver client webhooks and update the PostgreSQL read model. Neither is on the request path, and neither can revise the decision already made.
 
 #### 3.5.1 Internal Uniform Correlation ID vs. External Bank Correlation ID Mapping
 
@@ -404,15 +387,15 @@ To maintain strict architectural consistency across heterogeneous bank protocols
 
 1. **Internal Uniform Correlation ID (`correlationId` / `eventId`)**:
    - **Format**: Standardized internal `UUID` (e.g. `UUID.randomUUID()`) generated by the gateway.
-   - **Purpose**: Guarantees a consistent, time-ordered primary key across all internal application logs, Kafka event keys, RocksDB state stores, and PostgreSQL CQRS projection tables, regardless of which bank sent the callback.
+   - **Purpose**: Guarantees a consistent, time-ordered primary key across all internal application logs, Kafka event keys, `ChargeSettlementStore` records, and PostgreSQL CQRS projection tables, regardless of which bank sent the callback.
 2. **External Bank Correlation ID (`externalCorrelationId` / `bankReference`)**:
    - **Format**: Raw string provided by the bank or protocol adapter (e.g. SNAP `X-EXTERNAL-ID`, REST `X-Correlation-ID`, or `bankReference`). Formats vary widely across banks (alphanumeric, variable length, or missing).
    - **Purpose**: Maps internal events back to the bank's external reference for audit inquiries, EOD CSV settlement matching, and outbound client webhook headers (`X-Correlation-ID`).
 
-#### Propagation Lifecycle:
+#### Propagation Lifecycle
 - **Ingress Extraction**: Controller receives callback, generates internal `eventId` (UUID), and extracts `externalCorrelationId` from request headers/payload.
 - **Kafka Event Enrichment**: `PaymentReceivedEvent` contains both `eventId` (internal UUID) and `externalCorrelationId` (bank reference).
-- **RocksDB Idempotency**: `idempotency-store` indexes transactions by `externalCorrelationId` / `bankReference` to block duplicate bank callbacks within $<1\text{ms}$.
+- **`ChargeSettlementStore` Idempotency**: the `idem:` key namespace indexes transactions by `externalCorrelationId` / `bankReference` to block duplicate bank callbacks within the same atomic transaction.
 - **PostgreSQL CQRS Projection**: Read models store both `event_id` (UUID primary key) and `external_correlation_id`, allowing operators to search dashboard logs by either internal UUID or bank reference.
 - **Outbound Webhook Delivery**: `WebhookDispatcherWorker` attaches `X-Correlation-ID: <externalCorrelationId>` when delivering HTTP POST notifications to merchant subledgers (e.g. `account-receivable`).
 
@@ -421,24 +404,23 @@ To maintain strict architectural consistency across heterogeneous bank protocols
 A key architectural design question when building payment gateways is whether to use **In-Process Synchronous Validation** or **Deferred Synchronous Correlation**:
 
 1. **Single-Module Monolithic Layout with Local RocksDB (`payment-gateway-evtsrc`)**:
-   - **Mechanism**: The ingress controller, state stores, and stream topologies live in the same Spring Boot application process.
-   - **Validation**: When a bank callback (`POST /api/v1/payments`) arrives, the HTTP request thread queries `idempotency-store`, `va-registry-store`, and `charge-state-store` directly in local RocksDB RAM/SSD ($<1\text{ms}$).
-   - **Result**: The controller accepts or rejects the callback **in-process before returning**. It appends the event to Kafka and returns `HTTP 200 OK` directly on the request thread. **No `CompletableFuture` or broadcast consumer groups are required.**
+   - **Mechanism**: the ingress controllers, application services, and `ChargeSettlementStore` live in the same Spring Boot application process.
+   - **Validation**: when a bank callback (`POST /api/v1/payments`) arrives, the HTTP request thread runs one atomic RocksDB transaction against `ChargeSettlementStore` directly.
+   - **Result**: the controller accepts or rejects the callback **in-process before returning**, appends the already-decided fact to Kafka, and returns the HTTP response directly on the request thread. **No `CompletableFuture` or broadcast consumer groups are required.**
 
 2. **Distributed Microservices Layout (e.g. Ingress Gateway + Independent Bank Host Adapters / Clearing Core Microservices)**:
-   - **Mechanism**: The Ingress Gateway is decoupled into a thin edge microservice that does *not* host state, while downstream business logic (e.g. fraud screening, core settlement engine, or dedicated per-bank host adapter microservices) runs in separate application containers.
-   - **Validation**: When a request arrives, the Ingress Gateway microservice cannot validate state locally. It must publish a command event to Kafka (e.g. `bank-request-topic`) and **defer the HTTP response**.
-   - **Result**: The HTTP request thread registers a `CompletableFuture<Response>` keyed by correlation ID (`correlationId` / `bankReference`) and blocks on `future.get(timeout)`. Each Ingress Gateway replica runs a broadcast consumer group (`ingress-gateway-${instance-id}`) listening on `bank-response-topic` to correlate the outcome back to the waiting HTTP thread.
+   - **Mechanism**: the Ingress Gateway is decoupled into a thin edge microservice that does *not* host state, while downstream business logic (e.g. fraud screening, core settlement engine, or dedicated per-bank host adapter microservices) runs in separate application containers.
+   - **Validation**: when a request arrives, the Ingress Gateway microservice cannot validate state locally. It must publish a command event to Kafka (e.g. `bank-request-topic`) and **defer the HTTP response**.
+   - **Result**: the HTTP request thread registers a `CompletableFuture<Response>` keyed by correlation ID (`correlationId` / `bankReference`) and blocks on `future.get(timeout)`. Each Ingress Gateway replica runs a broadcast consumer group (`ingress-gateway-${instance-id}`) listening on `bank-response-topic` to correlate the outcome back to the waiting HTTP thread.
 
-#### Architectural Trade-off Comparison:
+#### Architectural Trade-off Comparison
 
-| Metric / Aspect | Single-Module Monolith (`payment-gateway-evtsrc`) | Distributed Microservices Layout |
+| Metric / Aspect | Single-Module Monolith (`payment-gateway-evtsrc`, as built) | Distributed Microservices Layout (not built here) |
 |---|---|---|
-| **State Location** | Embedded off-heap **RocksDB** on local App node. | External microservices / database stores across network. |
-| **Validation Point** | **In-Process** (HTTP thread queries RocksDB directly). | **Out-of-Process** (Ingress waits for downstream Kafka event). |
-| **Sync Response Latency** | **$<1\text{ ms}$** | **$50\text{--}500\text{ ms}$** |
-| **Correlation Strategy** | Standard event logging (`correlationId` header). | **Deferred `CompletableFuture` + Broadcast Consumer Groups**. |
-| **Operational Complexity** | **Low** (Single deployment artifact, zero fanout network traffic). | **High** (Per-instance consumer groups, network traffic amplification). |
+| **State Location** | `ChargeSettlementStore`, embedded RocksDB on the local App node. | External microservices / database stores across network. |
+| **Validation Point** | **In-Process** (HTTP thread runs the RocksDB transaction directly). | **Out-of-Process** (Ingress waits for a downstream Kafka-correlated event). |
+| **Correlation Strategy** | Standard event logging (`correlationId` header) — no deferred correlation needed. | Deferred `CompletableFuture` + broadcast consumer groups. |
+| **Operational Complexity** | Low (single deployment artifact, no fan-out network traffic on the decision path). | High (per-instance consumer groups, network traffic amplification). |
 
 ### 3.6 Initial Deployment Seeding for Pre-Existing Virtual Accounts & Charges
 
@@ -447,9 +429,9 @@ When deploying `payment-gateway-evtsrc` into an existing enterprise environment 
 1. **Database Dump Import**: DBAs restore legacy tables directly into PostgreSQL tables (`charge_projection`, `sibling_va_projection`).
 2. **On-Startup Registration**: When `app.migration.seed-from-postgres=true` is set and the settlement store is empty, `PostgresInitialStateSeeder` runs on application startup:
    - Reads active pre-existing charges and Virtual Accounts from PostgreSQL.
-   - Registers each one directly into `ChargeSettlementStore` (the same RocksDB `TransactionDB` the request-thread write path owns), synchronously, so they are resolvable via inquiry/payment the instant seeding finishes.
+   - Registers each one directly into `ChargeSettlementStore`, synchronously, so they are resolvable via inquiry/payment the instant seeding finishes.
    - Also emits the equivalent `ChargeCreatedEvent`/`SiblingVaRegisteredEvent` records to `charge-events`/`va-events`, purely so `PostgresProjectionSink` builds the matching read model.
-3. **Idempotent re-run guard, not changelog-backed durability**: `ChargeSettlementStore` is a plain, directly-owned RocksDB directory with no Kafka Streams changelog behind it. If `app.settlement-store.dir` is a persistent volume, the directory survives a restart and the seeder detects existing state and skips re-seeding. If it isn't, the store comes back empty and the seeder runs again on the next restart -- give it a persistent volume for a real migration.
+3. **Idempotent re-run guard, not changelog-backed durability**: `ChargeSettlementStore` is a plain, directly-owned RocksDB directory with no Kafka Streams changelog behind it. If `app.settlement-store.dir` is a persistent volume, the directory survives a restart and the seeder detects existing state and skips re-seeding. If it isn't, the store comes back empty and the seeder runs again on the next restart — give it a persistent volume for a real migration.
 
 ---
 
@@ -459,69 +441,73 @@ When deploying `payment-gateway-evtsrc` into an existing enterprise environment 
 
 | Operational Dimension | Traditional RDBMS (`payment-gateway`) | Event-Sourced CQRS (`payment-gateway-evtsrc`) |
 |---|---|---|
-| **Scaling Mechanism** | **Vertical Scaling (Scale-Up)**: Increase CPU, RAM, and NVMe IOPS on Primary PostgreSQL DB. Read Replicas offload read queries only. | **Horizontal Scaling (Scale-Out)**: Distribute topic partitions across additional Kafka Streams application instances and Kafka brokers. |
-| **Write Throughput Bottleneck** | **Single Primary DB Writer**: All bank callbacks hit the single primary database instance for `SELECT FOR UPDATE` and `COMMIT`. | **Kafka Partition Count**: Writes are partitioned across Kafka topics and processed in parallel across app nodes. |
-| **Failover Recovery SLA** | **10–30 seconds** (DB failover via Patroni/PgBouncer with connection re-establishment). | **<1 second** (Warm RocksDB standby replica promotion on peer app instance). |
-| **Operational Complexity** | **Low**: Standard Spring Boot CRUD app + single PostgreSQL DB cluster. Easy debugging and deployment. | **Moderate to High**: Requires managing Kafka cluster, Kafka Streams topologies, RocksDB off-heap memory, and async projection sinks. |
+| **Scaling mechanism** | **Vertical Scaling (Scale-Up)**: increase CPU, RAM, and NVMe IOPS on the primary PostgreSQL DB. Read replicas offload read queries only. | **Write path: not built yet.** `ChargeSettlementStore` is a per-instance local store; running more than one instance today just gives each instance its own disjoint set of charges, with no coordination. A real scale-out would need consistent chargeId-based request routing (§4.4). **Read/fan-out path: horizontal today** — `PostgresProjectionSink`/`WebhookDispatcherWorker` consumer concurrency scales with Kafka partition count. |
+| **Write throughput bottleneck** | Single primary DB writer: all bank callbacks hit the one primary database instance for `SELECT FOR UPDATE` and `COMMIT`. | Single JVM instance's `ChargeSettlementStore` throughput. Measured: ~960 req/s sustained with room to spare (peak VU usage stayed well under the 100-VU pre-allocation across a 50→2,000 TPS ramp) — see §5. |
+| **Failover recovery** | 10–30 seconds (DB failover via Patroni/PgBouncer with connection re-establishment). | **No automatic failover exists today.** Recovery depends on `app.settlement-store.dir` being a persistent volume (instance restarts with state intact) or a manual `PostgresInitialStateSeeder` re-seed from the Postgres projection (lossy for anything not yet projected) — see §4.4. |
+| **Operational complexity** | Low: standard Spring Boot CRUD app + single PostgreSQL DB cluster. | Moderate: Kafka cluster + a directly-owned RocksDB directory needing its own backup/persistence story + async projection/webhook consumers. No Kafka Streams cluster/topology to operate. |
 
 ---
 
 ### 4.2 Scalability Limitations & Bottlenecks
 
 #### 1. Traditional RDBMS Approach Limitations (`payment-gateway`)
-- **Primary Database Write Bottleneck**: While Read Replicas offload read traffic, all bank callback writes (`INSERT INTO payment`, `UPDATE charge SET balance = ...`) must execute on the single Primary PostgreSQL writer node inside a synchronous ACID transaction. Under heavy enrollment-scale bursts (e.g. tuition payment deadline), row-level locks (`SELECT FOR UPDATE`) cause thread pool exhaustion and bank callback timeouts (`504 Gateway Timeout`).
+- **Primary Database Write Bottleneck**: while read replicas offload read traffic, all bank callback writes (`INSERT INTO payment`, `UPDATE charge SET balance = ...`) must execute on the single primary PostgreSQL writer node inside a synchronous ACID transaction. Under heavy enrollment-scale bursts (e.g. tuition payment deadline), row-level locks (`SELECT FOR UPDATE`) cause thread pool exhaustion and bank callback timeouts (`504 Gateway Timeout`).
 - **I/O Contention During Reconciliation**: End-of-Day (EOD) CSV reconciliation imports execute heavy batch writes and table scans on the primary database, consuming disk IOPS and CPU, directly degrading callback SLA for real-time payments.
-- **Connection Pool Exhaustion**: High concurrent HTTP callback requests rapidly consume available PgBouncer / HikariCP connection pools, risking connection rejection under traffic spikes.
+- **Connection Pool Exhaustion**: high concurrent HTTP callback requests rapidly consume available PgBouncer / HikariCP connection pools, risking connection rejection under traffic spikes.
 - **Destructive State Updates**: `UPDATE` queries overwrite past state, destroying historical timeline auditability unless complex audit tables and database triggers are maintained.
 
 #### 2. Event-Sourced CQRS Approach Limitations (`payment-gateway-evtsrc`)
-- **Partition Count Bounded Parallelism**: Processing parallelism in Kafka Streams is strictly bounded by the number of partitions per Kafka topic. Increasing parallelism beyond the initial partition count requires a topic re-partitioning migration and state re-hydration.
-- **Storage Footprint Amplification**: Events are stored across three storage tiers: (1) immutable Kafka topic segment files, (2) embedded local RocksDB SSTable files on app instances, and (3) relational projection tables in PostgreSQL 18.
-- **Eventual Consistency & Projection Lag**: there is an inherent lag between Kafka event emission and PostgreSQL table update. `PostgresProjectionSink` exposes it live at `GET /api/admin/debug/projection-lag` (`{"lagMillis": null}` until the first payment is projected); no lag figure has been measured under load with the current batch-listener sink, so no number is quoted here — read the endpoint during any real benchmark run instead of assuming a value.
-- **Off-Heap C++ Native Memory Management**: RocksDB operates outside the JVM heap. Improper memory configuration (block cache, memtable bounds) can cause Linux OS OOM-killer to terminate application containers unexpectedly under heavy write pressure.
+- **Write path is single-instance only, today**: `ChargeSettlementStore` is a per-instance local RocksDB directory. Running a second instance does not add write capacity or resilience — it just owns a disjoint set of charges with no coordination between the two. Real horizontal write scale-out needs consistent chargeId-based routing to the instance owning that charge (analogous to Kafka Streams' `queryMetadataForKey()` pattern) — not yet built; see §4.4.
+- **Read/fan-out parallelism is partition-count bounded**: `PostgresProjectionSink` and `WebhookDispatcherWorker` are batch `@KafkaListener`s whose consumer concurrency is capped by topic partition count (`spring.kafka.listener.concurrency`, driven by `app.kafka.partitions`). Raising this after topics already exist requires a partition-count migration.
+- **Storage Footprint Amplification**: data lives in three places — immutable Kafka topic segment files, the local RocksDB directory on each app instance, and relational projection tables in PostgreSQL 18.
+- **Eventual Consistency & Projection Lag**: there is an inherent lag between Kafka event emission and PostgreSQL table update. `PostgresProjectionSink` exposes it live at `GET /api/admin/debug/projection-lag`; under the current benchmark load (§5) it stays in the single-digit-millisecond range throughout a full ramp, not zero.
+- **Off-Heap C++ Native Memory Management**: RocksDB operates outside the JVM heap. Improper memory configuration (block cache, memtable bounds) can cause the OS OOM-killer to terminate application containers unexpectedly under heavy write pressure.
+- **No changelog-backed recovery**: because `ChargeSettlementStore` isn't a Kafka Streams state store, there is no automatic re-hydration from a changelog topic if its local directory is lost — see §4.4.
 
 ---
 
-### 4.3 Initial Partition Count Decision Framework & Sizing Guide
+### 4.3 Kafka Partition Count: What It Actually Governs Today
 
-To guarantee strict event ordering and local state joins without inter-node network hops, all Kafka topics use a co-partitioned key strategy (`charge_id`).
+All Kafka topics use a co-partitioned key strategy (`charge_id`) for future routing potential, but today partition count governs one thing concretely: **consumer concurrency for the async fan-out**, not the write path (which doesn't use Kafka Streams or partitioned local state at all anymore).
 
-#### 1. The Engineering Sizing Formula
+#### 1. What partition count actually controls right now
+- **`PostgresProjectionSink` / `WebhookDispatcherWorker` throughput**: both are batch `@KafkaListener`s with `concurrency = app.kafka.partitions` (`spring.kafka.listener.concurrency`). More partitions → more concurrent consumer threads → more headroom before projection lag or webhook delivery lag grows under load.
+- **A precondition for future write-path scale-out**: if/when consistent chargeId-based request routing is built (§4.4), partition count would also cap how many `ChargeSettlementStore`-owning instances could exist, the same way it would for a Kafka Streams deployment. Not yet relevant, since that routing doesn't exist yet.
 
-In Apache Kafka and Kafka Streams, partition count determines the **maximum horizontal parallelism** of application worker threads:
-
-$$\text{Partitions} = \max\left( \frac{\text{Target Write Throughput (MB/s)}}{\text{Single Producer Max Throughput}}, \frac{\text{Target Read Throughput (MB/s)}}{\text{Single Consumer Max Throughput}} \right)$$
-
-Key constraints:
-- You **can never run more active application stream threads than there are topic partitions**. (e.g. 12 partitions allows scaling up to 12 threads across 1, 2, 3, 4, 6, or 12 container instances).
-- Each partition maps to an independent **local RocksDB state store partition** (`/var/data/rocksdb/partition_N`).
-
-#### 2. Metrics Required to Determine Initial Partition Count
-1. **Target Peak Throughput (TPS)**: Maximum expected bank callback TPS during enrollment/tuition deadline spikes.
-2. **Planned App Container Nodes**: Number of container instances and stream threads per node (e.g. 3 nodes $\times$ 4 stream threads = 12 total worker threads).
-3. **Divisibility Factor**: Selecting a partition count highly divisible by common node counts ($1, 2, 3, 4, 6, 12$) enables even workload distribution during horizontal scale-out.
+#### 2. Metrics relevant to sizing today
+1. **Target peak throughput (TPS)**: drives how much consumer concurrency the projection sink/webhook dispatcher need to avoid growing lag.
+2. **Planned app container nodes** (once write-path scale-out is built): would determine how partitions map to instances.
+3. **Divisibility factor**: a partition count divisible by likely instance counts ($1, 2, 3, 4, 6, 12$) keeps future scale-out even.
 
 #### 3. Recommended Partition Sizing Matrix
 
-| Scale Tier | Target Peak Throughput | App Nodes & Threads | Recommended Partitions | Scaling & Infrastructure Notes |
-|---|---|---|---|---|
-| **Starter / Development** | $<500\text{ TPS}$ | 1 App Instance (6 threads) | **6 Partitions** | **1:1 Infrastructure Parity** with single-node RDBMS baseline. |
-| **Production Baseline** | $1,000\text{--}3,000\text{ TPS}$ | 3 App Instances (4 threads/node = 12 threads) | **12 Partitions** | Divisible by 1, 2, 3, 4, 6, 12 instances; supports seamless scale-out. |
-| **High-Scale Enterprise** | $5,000\text{--}10,000+\text{ TPS}$ | 6 App Instances (4 threads/node = 24 threads) | **24 Partitions** | Maximum parallel processing across multi-AZ container clusters. |
-
-> **Why 12 Partitions is the Default Production Baseline**: In Kafka Streams, increasing topic partitions after initial deployment requires topic re-partitioning and re-hydrating RocksDB state stores. Selecting **12 partitions** upfront allows scaling from 1 to 12 instances smoothly without re-partitioning topics.
+| Scale Tier | Target Peak Throughput | Recommended Partitions | Notes |
+|---|---|---|---|
+| **Starter / Development** | $<500\text{ TPS}$ | **6 Partitions** (current default) | 1:1 infrastructure parity with the single-node RDBMS baseline. |
+| **Production Baseline** | $1,000\text{–}3,000\text{ TPS}$ | **12 Partitions** | Divisible by 1, 2, 3, 4, 6, 12 — headroom for the fan-out consumers, and for instance counts if write-path routing is later built. |
+| **High-Scale Enterprise** | $5,000\text{–}10,000+\text{ TPS}$ | **24 Partitions** | More fan-out consumer parallelism; still doesn't help write-path scale-out without the routing layer in §4.4. |
 
 #### 4. Current Implementation Status
 
-Topics are created explicitly by `KafkaTopicConfig` (`NewTopic` beans for `charge-events`, `va-events`, `payment-events`, `reconciliation-events`, `webhook-events`), not left to Kafka's auto-creation default of 1 partition. Partition count is the single property `app.kafka.partitions` (default **6**, matching the Starter tier above), `replicationFactor` **1**. `spring.kafka.listener.concurrency` for the projection sink's batch listener is driven by the same property. `spring.kafka.streams.num.stream.threads` is still hardcoded at **6** independently of `app.kafka.partitions` — raising the partition count without also raising this value under-utilizes the extra partitions. No throughput numbers below reflect a run against this partitioning; they are unmeasured until a benchmark is executed with it in place.
+Topics are created explicitly by `KafkaTopicConfig` (`NewTopic` beans for `charge-events`, `va-events`, `payment-events`, `reconciliation-events`, `webhook-events`), not left to Kafka's auto-creation default of 1 partition. Partition count is the single property `app.kafka.partitions` (default **6**, matching the Starter tier above), `replicationFactor` **1**, and it also drives `spring.kafka.listener.concurrency` for both the projection sink's and webhook dispatcher's batch listeners. There is no `spring.kafka.streams.*` configuration at all — Kafka Streams was removed entirely (see §1). No throughput numbers here reflect an untested configuration; §5 is the actual measured benchmark.
 
 ---
 
-### 4.4 Production High-Availability & Replication Topologies
+### 4.4 High Availability — What Exists Today, and What Would Need Building
 
-#### 1. Event-Sourced CQRS HA Topology (`payment-gateway-evtsrc`)
+#### 1. Event-Sourced CQRS (`payment-gateway-evtsrc`) — honest current state
 
-For high-availability production deployment, the event-sourced architecture implements a multi-tier quorum and warm standby strategy:
+There is **no multi-instance HA story for the write path today**. `ChargeSettlementStore` is a local RocksDB directory owned by one JVM instance, with no changelog topic, no standby replica, and no cross-instance coordination. This is a deliberate trade-off of the current design (see `ChargeSettlementStore`'s own Javadoc), not an oversight — it's what makes the write path a single, zero-Kafka-round-trip atomic transaction instead of a distributed one.
+
+What recovery looks like today:
+- **Instance restart with an intact volume**: `app.settlement-store.dir` on a persistent volume survives the restart; the app comes back with all state intact, no re-hydration needed.
+- **Instance restart with an ephemeral volume, or a lost disk**: the local store comes back empty. `PostgresInitialStateSeeder` (§3.6) can re-seed from the Postgres projection, but anything created or paid after the last successful Postgres projection is lost from the write-path store specifically — a real gap, not a theoretical one.
+- **Postgres itself failing**: unaffected on the write path. Bank callbacks keep succeeding because the decision never touches Postgres; the read model just falls behind and catches up once Postgres is back.
+
+What multi-instance write-path HA would require (not yet built):
+1. **Consistent chargeId-based request routing** to the one instance that owns a given charge's local store — the same problem a Kafka Streams deployment solves with `queryMetadataForKey()`-style routing.
+2. **A real replication or backup strategy** for each instance's RocksDB directory, since there's no changelog fallback. Options include periodic snapshot shipping, a replicated block device, or accepting `PostgresInitialStateSeeder`'s lossy-since-last-projection re-seed as the recovery plan.
+3. **Kafka's own durability** (`replication.factor=3`, `acks=all`, `min.insync.replicas=2`) still matters for the *fan-out* log — it gives RPO=0 for the Postgres projection and webhook delivery, independent of whatever the write-path HA story ends up being. This is the one piece of the diagram below that's still accurate as drawn.
 
 ```mermaid
 flowchart TD
@@ -529,55 +515,38 @@ flowchart TD
         LB[Load Balancer / Ingress Router]
     end
 
-    subgraph App_Tier ["Kafka Streams Processing Tier (3 App Instances)"]
-        subgraph APP1 ["App Instance 1"]
-            A1_ACT["Active Partitions 1..4"]
-            A1_STB["Standby Partitions 5..8 (RocksDB)"]
-        end
-        subgraph APP2 ["App Instance 2"]
-            A2_ACT["Active Partitions 5..8"]
-            A2_STB["Standby Partitions 9..12 (RocksDB)"]
-        end
-        subgraph APP3 ["App Instance 3"]
-            A3_ACT["Active Partitions 9..12"]
-            A3_STB["Standby Partitions 1..4 (RocksDB)"]
-        end
+    subgraph App_Tier ["App Instances -- each owns its OWN local ChargeSettlementStore, no coordination between them today"]
+        APP1["App Instance 1<br/>ChargeSettlementStore (local RocksDB)"]
+        APP2["App Instance 2<br/>ChargeSettlementStore (local RocksDB)"]
+        APP3["App Instance 3<br/>ChargeSettlementStore (local RocksDB)"]
     end
 
-    subgraph Kafka_Tier ["Kafka Cluster Quorum (Storage Layer)"]
+    subgraph Kafka_Tier ["Kafka Cluster Quorum (Fan-Out Log Only)"]
         K1[Broker 1]
         K2[Broker 2]
         K3[Broker 3]
-        KAFKA_CFG["RF = 3 | min.isr = 2 | acks = all"]
+        KAFKA_CFG["RF = 3 | min.isr = 2 | acks = all<br/>-- durable for fan-out, not a substitute for write-path HA"]
     end
 
-    subgraph DB_Tier ["PostgreSQL 18 HA Cluster (Reporting Layer)"]
+    subgraph DB_Tier ["PostgreSQL 18 HA Cluster (Reporting Layer Only)"]
         PG_PRI[(PostgreSQL Primary)]
         PG_REP[(PostgreSQL Streaming Replica)]
         PATRONI["Patroni + PgBouncer HA Pooler"]
     end
 
-    %% Ingress routes
-    LB --> APP1
-    LB --> APP2
-    LB --> APP3
+    LB -.->|"Without chargeId-consistent routing (not built),<br/>a request can land on the wrong instance"| APP1
+    LB -.-> APP2
+    LB -.-> APP3
 
-    %% App to Kafka
-    APP1 <-->|Read/Write Streams & Changelogs| Kafka_Tier
-    APP2 <-->|Read/Write Streams & Changelogs| Kafka_Tier
-    APP3 <-->|Read/Write Streams & Changelogs| Kafka_Tier
+    APP1 -->|Publish already-decided facts| Kafka_Tier
+    APP2 -->|Publish already-decided facts| Kafka_Tier
+    APP3 -->|Publish already-decided facts| Kafka_Tier
 
-    %% Kafka to Postgres
     Kafka_Tier -->|Async CQRS Event Stream| PG_PRI
     PG_PRI -->|Streaming Replication| PG_REP
     PATRONI --- PG_PRI
     PATRONI --- PG_REP
 ```
-
-##### Event-Sourced HA Mechanics:
-- **Kafka Storage Quorum**: Minimum **3 Kafka Brokers** (KRaft mode). `replication.factor = 3`, `min.insync.replicas = 2`, `acks = all`. Tolerates failure of 1 broker without data loss ($N=3, W=2, R=2$).
-- **Kafka Streams Warm Standbys**: App instances run with `num.standby.replicas = 1`. Peer app nodes maintain shadow RocksDB standby replicas in background by consuming changelog topics. If **App Instance 1** fails, **App Instance 2** promotes its warm local RocksDB standby to active in **$<1\text{ second}$**, eliminating network state re-hydration.
-- **Non-Blocking Reporting HA**: PostgreSQL 18 is managed by Patroni + PgBouncer. If PostgreSQL fails completely, bank callbacks continue operating without interruption; events buffer in Kafka until Postgres recovers.
 
 ---
 
@@ -607,7 +576,6 @@ flowchart TD
         PATRONI["Patroni + Etcd DCS <br/> Auto-Failover Orchestrator"]
     end
 
-    %% Routing
     LB --> APP1
     LB --> APP2
     LB --> APP3
@@ -624,26 +592,26 @@ flowchart TD
     PATRONI --- PG_REP
 ```
 
-##### RDBMS HA Mechanics:
-- **Single Primary Writer**: All 3 application instances write to the single Primary PostgreSQL 18 database through PgBouncer.
-- **Failover SLA (RTO 10–30s)**: If the Primary DB node fails, Patroni promotes the Read Replica to Primary and re-routes PgBouncer connections. During this $10\text{--}30\text{ second}$ failover window, **all incoming bank callbacks fail or time out**.
-- **Vertical Bottleneck**: Increasing bank callback throughput requires scaling up the Primary DB machine's CPU, RAM, and NVMe IOPS. Adding app instances does not increase write capacity.
+##### RDBMS HA Mechanics
+- **Single Primary Writer**: all 3 application instances write to the single primary PostgreSQL 18 database through PgBouncer.
+- **Failover SLA (RTO 10–30s)**: if the primary DB node fails, Patroni promotes the read replica to primary and re-routes PgBouncer connections. During this window, all incoming bank callbacks fail or time out.
+- **Vertical Bottleneck**: increasing bank callback throughput requires scaling up the primary DB machine's CPU, RAM, and NVMe IOPS. Adding app instances does not increase write capacity.
 
 ---
 
 ### 4.5 Event Stream Replay & Projection Rebuild Runbook
 
-One of the key benefits of this Event Sourcing setup is the ability to wipe the PostgreSQL reporting database and rebuild all read models from genesis:
+One benefit of Event Sourcing that survives the rearchitecture intact: the PostgreSQL reporting database can be wiped and rebuilt from genesis, purely from the Kafka event log. (This rebuilds the **read model** only — it does not, and cannot, rebuild `ChargeSettlementStore`'s own write-path state; see §4.4.)
 
-1. **Stop Projection Sink Consumer**: Pause the `projection-sink` consumer group.
-2. **Apply Flyway Schema Migration**: Truncate or drop/recreate PostgreSQL projection tables (`charge_projection`, `payment_projection`, `reconciliation_projection`).
+1. **Stop Projection Sink Consumer**: pause the `payment-gateway-projection-sink` consumer group.
+2. **Apply Flyway Schema Migration**: truncate or drop/recreate PostgreSQL projection tables (`charge_projection`, `payment_projection`, `reconciliation_projection`).
 3. **Reset Consumer Group Offset**:
    ```bash
    kafka-consumer-groups --bootstrap-server kafka:9092 \
      --group payment-gateway-projection-sink \
      --reset-offsets --to-earliest --execute --topic charge-events,payment-events,va-events
    ```
-4. **Restart Projection Sink**: The consumer group replays all events from `offset 0` into PostgreSQL. `projection_lag_ms` drops back to `0` upon completion.
+4. **Restart Projection Sink**: the consumer group replays all events from `offset 0` into PostgreSQL. `GET /api/admin/debug/projection-lag` drops back toward zero as it catches up.
 
 ---
 
@@ -657,12 +625,14 @@ same 6 BSI VA/amount pairs from `scenarios/seed-data.json`. Both scripts require
 stage — the exact "empty/`\"null\"` secret" bug this replaces is documented in
 `docs/benchmark-remediation-guideline.md` finding F5).
 
-**Full methodology, both runs' numbers, the financial-correctness audit, and a real finding about
-performance degrading under sustained load on a small hot-row dataset are in
-[`scenarios/perf_benchmark_report.md`](scenarios/perf_benchmark_report.md).** Headline result: both
-systems pass their error-rate and p99 thresholds; RDBMS is faster at the median (a single SQL
-transaction vs. three RocksDB queries plus a Kafka round-trip), evtsrc holds up better under
-sustained contention on the same small set of rows.
+**Full methodology, both runs' numbers, the financial-correctness audit, and the write-path
+rearchitecture's own re-benchmarks (Seventh/Eighth gap) are in
+[`scenarios/perf_benchmark_report.md`](scenarios/perf_benchmark_report.md).** Headline result, current
+architecture: median latency in the low single-digit milliseconds, p99 around 8.5–9.2ms, no
+saturation observed across the full 50→2,000 TPS ramp (peak VU usage stayed well inside the 100-VU
+pre-allocation), correctness audits passing with 0 mismatches. Neither system is sub-millisecond
+end-to-end once checksum verification and the network round-trip are counted — see the linked report
+for exact, per-run numbers rather than a summary claim here.
 
 Reproduce with `./scenarios/run-benchmark.sh <target-url>` (evtsrc) or the equivalent direct `k6 run`
 invocation documented in `suite-rdbms.js`'s header (RDBMS), then audit with
@@ -676,21 +646,24 @@ to guess in that case).
 
 ### 6.1 Project Module Layout & Application Structure
 
-For maximum **1:1 repository parity** with the relational `payment-gateway` baseline, `payment-gateway-evtsrc` is structured as a **single Spring Boot application module** (single `pom.xml`). All CQRS write paths, Kafka Streams topologies, projection sinks, and web controllers live within a single application artifact, organized by package boundary:
+For maximum **1:1 repository parity** with the relational `payment-gateway` baseline, `payment-gateway-evtsrc` is structured as a **single Spring Boot application module** (single `pom.xml`), organized by package boundary:
 
-#### Single-Module Layout (Recommended Default for 1:1 Parity)
 ```
 payment-gateway-evtsrc/
 ├── src/
 │   ├── main/
 │   │   ├── java/com/artivisi/paymentgateway/
-│   │   │   ├── domain/             # Immutable Event DTOs & Aggregate State Models
+│   │   │   ├── domain/             # Immutable event DTOs (ChargeCreatedEvent, PaymentReceivedEvent, ...)
 │   │   │   ├── web/
-│   │   │   │   ├── api/            # Bank Callback Controllers (Maybank SNAP, BSI REST, CIMB SOAP)
-│   │   │   │   └── admin/          # Operator Dashboard Controllers (Thymeleaf / HTMX)
-│   │   │   ├── streams/            # Kafka Streams Topologies & Embedded RocksDB Stores
-│   │   │   ├── projection/         # PostgreSQL 18 Projection Sink & Spring Data JPA Repositories
-│   │   │   └── config/             # Kafka, RocksDB, and Security Configuration
+│   │   │   │   ├── api/            # Bank callback controllers (Maybank SNAP, BSI REST, CIMB SOAP)
+│   │   │   │   └── admin/          # Operator dashboard controllers (Thymeleaf / HTMX)
+│   │   │   ├── service/            # ChargeApplicationService / PaymentApplicationService / InquiryApplicationService
+│   │   │   ├── settlement/         # ChargeSettlementStore -- the directly-owned RocksDB write path
+│   │   │   ├── projection/         # PostgresProjectionSink & Spring Data JPA entities/repositories
+│   │   │   ├── webhook/            # WebhookDispatcherWorker
+│   │   │   ├── reconciliation/     # ReconciliationProcessor (CSV import)
+│   │   │   ├── migration/          # PostgresInitialStateSeeder
+│   │   │   └── config/             # Kafka topic provisioning, bank secrets, security configuration
 │   │   └── resources/
 │   │       ├── db/migration/       # Flyway SQL Migration Scripts (PostgreSQL 18 Schema)
 │   │       ├── templates/          # Thymeleaf UI Templates
@@ -700,8 +673,7 @@ payment-gateway-evtsrc/
 └── pom.xml                         # Single Maven Build Descriptor
 ```
 
-#### Alternative Multi-Module Layout (Optional for Microservice Isolation)
-If enterprise deployment teams require running `ingress-gateway` and `streams-engine` as independently deployed container artifacts, the package hierarchy can optionally be split into Maven submodules (`message-model`, `ingress-gateway`, `streams-engine`, `projection-sink`, `admin-web`).
+There is no `streams/` package — Kafka Streams was removed entirely (see §1); `settlement/` is where the write path actually lives now.
 
 ---
 
@@ -711,8 +683,8 @@ If enterprise deployment teams require running `ingress-gateway` and `streams-en
 |---|---|
 | **Language & Runtime** | Java 25 |
 | **Framework** | Spring Boot 4.1.0 (Spring Web, Spring Data JPA, Spring Security) |
-| **Event Store & Streaming** | Apache Kafka & Kafka Streams |
-| **Hot-Path State Store** | RocksDB (`rocksdbjni`) |
+| **Write-path event log & fan-out** | Apache Kafka (no Kafka Streams) |
+| **Write-path state store** | `ChargeSettlementStore` — directly-owned RocksDB `TransactionDB` (`rocksdbjni`) |
 | **Reporting Projection DB** | PostgreSQL 18 + Flyway Migrations |
 | **Integration & Test Suite** | Testcontainers (Kafka & PostgreSQL 18), JUnit 5, RestAssured |
 | **Performance Benchmarking** | **k6** (Reusable load testing scripts across RDBMS & CQRS) |
