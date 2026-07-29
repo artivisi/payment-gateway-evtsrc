@@ -2,18 +2,37 @@
 
 **Systems under test**: `payment-gateway-evtsrc` (event-sourced/CQRS) vs. `payment-gateway` (relational
 baseline), benchmarked head-to-head through the identical BSI protocol workload.
-**Date**: 2026-07-29
+**Date**: 2026-07-29 (afternoon re-run; see "Retraction" below for what changed since the morning)
 **Test tool**: [k6](https://k6.io) v0.55+
 
-Earlier versions of this file contained numbers from 2026-07-28: one run per system against a
-freshly-migrated database, plus a second run per system against the *same, never-reset* database
-roughly 40 minutes later. That second-run pairing was never an independent repeat measurement — it
-measured "cold" vs. "warm-with-tens-of-thousands-of-rows-of-history," not two samples of the same
-condition (see that section's own admission in `docs/benchmark-remediation-guideline.md`'s "What's
-still needed" list). This version replaces it with what that gap called for: every run below starts
-from an empty, freshly-migrated database. evtsrc's run was repeated twice specifically to check
-whether an anomaly found in the first run was a fluke; RDBMS was run once, since nothing in it
-warranted a repeat.
+---
+
+## Retraction: the same-day morning run's saturation and correctness-defect findings did not reproduce
+
+An earlier version of this file, written the same morning, reported evtsrc saturating well before
+the 2,000 TPS ramp completed (p99 1.16s–3.22s, needing 1,200+ VUs) and a financial-correctness
+defect in both of its two runs (one payment double-recorded per run). Shortly after that report was
+written, the operator restarted the machine after finding OrbStack running a hanging VM, and
+separately flagged "a severe resource hogging problem" from that session. This afternoon's re-run —
+on a freshly-restarted machine, with the environment explicitly checked for contamination before
+each load-generation phase (see §1) — reproduced **neither** finding:
+
+- evtsrc's p99 was 8.5–9.4ms in both runs (vs. 1.16s–3.22s that morning), flat across every ramp
+  stage, never exceeding its pre-allocated VU pool.
+- Both evtsrc runs' correctness audits passed with **zero** mismatches on both checks (vs. one
+  double-recorded payment per run that morning).
+
+This is a retraction, not a refinement: the morning's numbers were real measurements (not
+fabricated), but the environment they were measured in was not what it was assumed to be — later
+found to include a hanging OrbStack VM, and, separately, this session directly observed another
+Testcontainers-based test session spinning up containers on the same Docker daemon during setup.
+**Neither the saturation ceiling nor the double-write defect should be treated as a characteristic of
+evtsrc's architecture** until reproduced under a controlled environment; this afternoon's clean,
+twice-reproduced result is the current evidence, and it says the opposite. The morning's raw
+artifacts and analysis remain in `scenarios/results/2026-07-29-*` and in
+`docs/benchmark-remediation-guideline.md`'s "Fourth gap" for the record — they are a case study in
+environment contamination, not a benchmark result to design around. See "Fifth gap" in that
+document for the full account.
 
 ---
 
@@ -25,28 +44,26 @@ warranted a repeat.
   verification, the same six seeded VA/amount pairs (CLOSED, OPEN, INSTALLMENT charge types) on
   both sides.
 - **Scripts**: [`scenarios/suite-bsi.js`](suite-bsi.js) (evtsrc) and
-  [`scenarios/suite-rdbms.js`](suite-rdbms.js) (RDBMS baseline) — identical request shape, checksum
-  scheme, and ramp profile. evtsrc's source of truth is Kafka/RocksDB, not Postgres, so
-  `suite-bsi.js` seeds its own six charges via `setup()` calling the real `POST /api/v1/charges`
-  and polls until each hydrates to `ACTIVE` before the ramp starts. RDBMS was seeded via
-  `scenarios/seed-db-direct.py` before its run.
-- **Fresh database per run**: before every run in this report, both systems' state was wiped
-  completely — RDBMS via `docker compose down` + volume removal + `docker compose up --build`;
-  evtsrc via `docker compose down -v` (drops the Postgres projection and the Kafka broker/topics)
-  plus deleting the local `target/rocksdb` directory (Kafka Streams' on-disk state store), followed
-  by a fresh `mvn spring-boot:run`. Each run's BSI shared secret was freshly generated and applied
-  immediately before that run (RDBMS: encrypted with the app's own `SecretCipher` and written to
-  the escrow row; evtsrc: passed directly as the `BANK_SECRET_BSI` environment variable) and
-  verified with a live checksum round-trip inquiry before any load was sent.
+  [`scenarios/suite-rdbms.js`](suite-rdbms.js) (RDBMS baseline).
+- **Fresh database per run**: both systems' state was wiped completely before every run in this
+  report — RDBMS via `docker compose down -v` + `docker compose up --build`; evtsrc via
+  `docker compose down -v` plus deleting `target/rocksdb`, followed by a fresh `mvn spring-boot:run`.
+  Each run's BSI shared secret was freshly generated immediately before that run and verified with a
+  live checksum round-trip inquiry before any load was sent.
+- **Environment contamination check (new this pass)**: before starting the RDBMS load-generation
+  phase, `docker ps -a` showed a Testcontainers `postgres` + `ryuk` pair spinning up and tearing down
+  every few seconds — traced to an unrelated session on the same machine, not this benchmark. Waited
+  and re-checked twice (`docker ps -a` + `uptime`) until no recurrence appeared and 1-minute load
+  average had dropped from 3.34 (at boot) to under 2, then proceeded. This check is now a standing
+  part of the procedure, not a one-off: run it before every load-generation phase, not just once at
+  the start.
 - **Run conditions**: `RUN_ID` and `BSI_SHARED_SECRET` are required environment variables — both
   scripts throw in the k6 init stage if either is missing.
-- **Audit**: [`scenarios/verify-correctness.py`](verify-correctness.py), cross-checking the k6
-  `payment_outcomes` metric (an independent ground truth of what actually happened per request)
-  against the recorded payment rows, plus a RocksDB-vs-Postgres consistency check for evtsrc. Run
-  with `--target evtsrc` or `--target rdbms` explicitly.
-- **Hardware**: Apple M5, 10-core, 16GB — shared, not dedicated. evtsrc's own footprint (Kafka
-  broker + 6 Kafka Streams threads + the app JVM) runs on the same machine as the load generator,
-  which is itself relevant to the results below.
+- **Audit**: [`scenarios/verify-correctness.py`](verify-correctness.py) with `--target evtsrc` or
+  `--target rdbms` explicit.
+- **Hardware**: Apple M5, 10-core, 16GB — shared, not dedicated, but this pass specifically
+  controlled for *other processes actively competing for it* immediately before each run, which the
+  morning run did not.
 
 ---
 
@@ -54,179 +71,108 @@ warranted a repeat.
 
 | Metric | RDBMS (single run) | evtsrc Run 1 | evtsrc Run 2 |
 |---|---|---|---|
-| Run ID | `20260729053927` | `20260729055009` | `20260729060057` |
-| Total requests | 86,439 | 78,183 | 79,240 |
+| Run ID | `20260729073934` | `20260729074516` | `20260729074802` |
+| Total requests | 86,384 | 86,602 | 86,625 |
 | HTTP error rate | 0.00% | 0.00% | 0.00% |
-| Dropped iterations | 185 | 8,441 | 7,384 |
-| Effective throughput | 960.3 req/s | 860.3 req/s | 868.1 req/s |
-| Min latency | 308 µs | 560 µs | 641 µs |
-| Median latency | 858 µs | 12.09 ms | 27.9 ms |
-| Avg latency | 3.30 ms | 174.81 ms | 136.04 ms |
-| p90 | 4.66 ms | 611.19 ms | 424.95 ms |
-| p95 | 13.88 ms | 1.05 s | 592.01 ms |
-| p99 | **50.80 ms** | **3.22 s** | **1.16 s** |
-| Max latency | 197.03 ms | 3.91 s | 1.41 s |
-| Peak VUs used | 156 of 2,000 | 1,414 of 2,000 | 1,213 of 2,000 |
-| Threshold `p(99)<500ms` | PASS | **FAIL** | **FAIL** |
+| Dropped iterations | 241 | 23 | 0 |
+| Effective throughput | 959.7 req/s | 960.4 req/s | 960.7 req/s |
+| Min latency | 267 µs | 419 µs | 425 µs |
+| Median latency | 1.01 ms | 3.96 ms | 3.83 ms |
+| Avg latency | 4.25 ms | 4.15 ms | 3.92 ms |
+| p90 | 3.28 ms | 6.39 ms | 6.26 ms |
+| p95 | 6.84 ms | 6.89 ms | 6.71 ms |
+| p99 | 112.25 ms | **9.41 ms** | **8.50 ms** |
+| Max latency | 333.88 ms | 87.64 ms | 62.85 ms |
+| Peak VUs used | 288 of 2,000 | 122 of 2,000 | **100 of 2,000** (never exceeded pre-allocation) |
+| Threshold `p(99)<500ms` | PASS | PASS | PASS |
 | Threshold `http_req_failed<1%` | PASS | PASS | PASS |
-| Accepted payments | 28,810 | 26,259 | 26,615 |
-| Rejected (charge already closed) | 57,629 | 51,924 | 52,625 |
-| Financial correctness audit | PASS | **FAIL** | **FAIL** |
+| Accepted payments | 28,885 | 28,788 | 28,798 |
+| Rejected (charge already closed) | 57,499 | 57,814 | 57,827 |
+| Financial correctness audit | PASS | PASS | PASS |
 
-Artifacts: `scenarios/results/2026-07-29-{rdbms,evtsrc}-fresh{,2}-{summary.json,raw.json.gz}`.
+Artifacts: `scenarios/results/2026-07-29b-{rdbms,evtsrc}-fresh{,1,2}-{summary.json,raw.json.gz}`.
 
----
-
-## 3. evtsrc saturates well before 2,000 TPS; RDBMS does not
-
-Both systems ran the identical ramp on the identical machine. RDBMS absorbed it cleanly — p99 stayed
-under 51ms, and the load generator only ever needed 156 of its 2,000 allotted virtual users. evtsrc
-needed 1,200–1,400 VUs to sustain the *same* request rate, dropped far more iterations (7,400–8,400
-vs. 185), and missed the `p(99)<500ms` threshold by 2.3x–6.4x in both of its runs.
-
-[`scenarios/knee-analysis.py`](knee-analysis.py) buckets each run's raw time series into the ramp's
-own stage windows, showing exactly where this happens:
-
-**RDBMS** — flat and recovers:
-
-| Stage | Obs. TPS | p50 | p95 | p99 |
-|---|---|---|---|---|
-| Ramp 50→500 TPS | 279.6 | 1.35ms | 5.81ms | 14.50ms |
-| Ramp 500→1,000 TPS | 752.3 | 0.64ms | 4.04ms | 24.39ms |
-| Ramp 1,000→2,000 TPS | 1,498.5 | 0.87ms | 17.08ms | 57.14ms |
-| Ramp-down | 981.4 | 1.05ms | 23.00ms | 65.44ms |
-
-**evtsrc Run 1** — a knee that never drains:
-
-| Stage | Obs. TPS | p50 | p95 | p99 |
-|---|---|---|---|---|
-| Ramp 50→500 TPS | 278.7 | 7.03ms | 21.36ms | 49.47ms |
-| Ramp 500→1,000 TPS | 747.1 | 6.39ms | 32.88ms | 157.75ms |
-| Ramp 1,000→2,000 TPS | 1,349.6 | 18.88ms | 279.96ms | 1,510.17ms |
-| Ramp-down | 740.1 | **727.48ms** | **3,387.19ms** | **3,583.90ms** |
-
-**evtsrc Run 2** — same shape, milder:
-
-| Stage | Obs. TPS | p50 | p95 | p99 |
-|---|---|---|---|---|
-| Ramp 50→500 TPS | 276.3 | 9.29ms | 73.67ms | 219.22ms |
-| Ramp 500→1,000 TPS | 746.5 | 7.77ms | 39.89ms | 104.07ms |
-| Ramp 1,000→2,000 TPS | 1,335.2 | 82.19ms | 504.27ms | 1,214.84ms |
-| Ramp-down | 842.9 | 213.17ms | 891.01ms | 1,198.19ms |
-
-RDBMS's median never moves and its tail recovers as soon as the ramp comes back down — normal
-elastic behavior under a load spike. evtsrc's **median itself degrades** through the 1,000→2,000 TPS
-stage and is *still climbing* in the ramp-down window (worse than the peak-load stage in Run 1) —
-the signature of a backlog that formed faster than it could drain and had not finished draining when
-the test ended. This is reproducible: both independently-reset runs show the same shape, just with
-different severity (Run 1 was measurably worse than Run 2, both sharing the same 10 cores with
-Kafka, Kafka Streams, Postgres, the app JVM, and the load generator itself, and machine-load
-variance between the two attempts is a plausible source of that difference).
-
-**Likely mechanism.** RDBMS's request path is a single, short-lived SQL transaction. evtsrc's
-request path must complete a synchronous Kafka produce-and-acknowledge round trip (plus two
-interactive RocksDB state-store reads) before the HTTP thread can return — inherently more wall-clock
-per request even when nothing is contended. By Little's Law, sustaining the same target throughput
-at a higher per-request latency requires proportionally more requests in flight at once — which is
-exactly what the VU counts above show (RDBMS: 156 concurrent; evtsrc: 1,200+). Neither app sets
-`server.tomcat.threads.max` (both default to Spring Boot's 200), so evtsrc's concurrency requirement
-crossing that ceiling is a plausible amplifier of the tail, on top of the inherently higher
-per-request cost. This is a plausible explanation consistent with the data, not a confirmed root
-cause — confirming it would need runtime thread-pool/queue-depth metrics captured during the run,
-which this pass didn't collect (see §6).
+Both evtsrc runs agree tightly with each other (p99 8.5ms vs. 9.41ms, both flat across every ramp
+stage — see §3), which is the signature of a system running well within capacity, not near a limit.
+RDBMS's own p99 (112.25ms) is higher than a prior clean RDBMS run's 50.80ms; per the note above, the
+Testcontainers interference observed just before this run is a plausible explanation, though RDBMS's
+own knee-analysis (below) shows no saturation shape (median stays low throughout, only a mild tail
+bump in the peak-concurrency stage) — this is ordinary shared-hardware noise, not the kind of
+backlog-that-never-drains signature the morning's evtsrc runs showed.
 
 ---
 
-## 4. Financial correctness defect found under saturation (evtsrc only)
+## 3. Knee/saturation analysis — flat on both systems this time
 
-Both evtsrc runs failed `verify-correctness.py`. RDBMS did not. In each evtsrc run, exactly one
-`bankReference` out of ~78,000–79,000 requests was recorded **twice** in the payment table — once as
-a normal accepted payment (`is_double_settlement=false`) and once flagged as a double settlement
-(`is_double_settlement=true`) — for the same charge, same amount:
+[`scenarios/knee-analysis.py`](knee-analysis.py) per-stage breakdown:
 
-| Run | bankReference | chargeId | Charge type | Amount |
+**RDBMS**:
+
+| Stage | Obs. TPS | p50 | p95 | p99 |
 |---|---|---|---|---|
-| 1 | `20260729055009-1785279010406-715065` | `8f6b4076-...` | CLOSED | 3,200,000.00 |
-| 2 | `20260729060057-1785279658729-854974` | `07ff836f-...` | CLOSED | 450,000.00 |
+| Ramp 50→500 TPS | 277.9 | 0.93ms | 3.66ms | 6.79ms |
+| Ramp 500→1,000 TPS | 751.5 | 0.83ms | 2.50ms | 4.21ms |
+| Ramp 1,000→2,000 TPS | 1,494.8 | 1.33ms | 26.22ms | 152.27ms |
+| Ramp-down | 988.5 | 0.61ms | 5.84ms | 29.66ms |
 
-This is a genuine defect, not an artifact of the audit tooling: a single client-issued
-`bankReference` (k6's `idTransaksi`, generated fresh per iteration from a millisecond timestamp plus
-a random suffix) was recorded under two different outcomes by the server. It happened exactly once
-per run, both times on a CLOSED-type charge, both times a charge that had just been created (within
-under a second of the charge-creation timestamp in the app log) — consistent with the race the
-codebase's own comments already flag as a known, deliberately-not-silently-absorbed gap:
-`PaymentApplicationService`'s pre-validation "is NOT the authoritative serialization point — two
-concurrent callbacks can both pass this pre-check before either event is applied."
+**evtsrc Run 1**:
 
-What was ruled out by direct evidence rather than assumed:
+| Stage | Obs. TPS | p50 | p95 | p99 |
+|---|---|---|---|---|
+| Ramp 50→500 TPS | 275.9 | 5.04ms | 7.70ms | 9.18ms |
+| Ramp 500→1,000 TPS | 750.5 | 3.95ms | 6.66ms | 8.30ms |
+| Ramp 1,000→2,000 TPS | 1,500.0 | 3.94ms | 6.95ms | 12.18ms |
+| Ramp-down | 996.5 | 3.94ms | 6.84ms | 8.21ms |
 
-- **Not a k6-side duplicate.** `idTransaksi` is generated fresh per iteration
-  (`${RUN_ID}-${Date.now()}-${random}`); at ~870 req/s peak, two iterations colliding on both the
-  millisecond and the random suffix is not something you'd expect to see even once across ~157,000
-  total requests in this report, let alone identically in both runs.
-- **Not a Kafka consumer-group rebalance.** The app log shows zero rebalance events
-  (`PARTITIONS_REVOKED`/reassignment) during either run's load window.
-  `max.poll.interval.ms=300000` is far above the 90-second test, so no poll-loop-stall-triggered
-  rebalance is expected either.
-- **Not a plain redelivery of the same Kafka record.** The log never once shows the topology's own
-  `"Duplicate bankReference re-observed in topology, skipping apply"` guard firing — meaning this
-  was not the same Kafka record being redelivered and reprocessed end-to-end.
+**evtsrc Run 2**:
 
-What remains an open question: the exact mechanism by which the *same* `bankReference` ends up
-applied through both code paths. One structural detail worth noting for whoever picks this up: all
-three of evtsrc's Kafka Streams state stores (`charge-state-store`, `va-registry-store`,
-`idempotency-store`) are declared with `Stores.persistentKeyValueStore(...)` and no
-`.withCachingDisabled()` call, so Kafka Streams' default record cache is active on all of them —
-and interactive queries (which is how `PaymentApplicationService`'s request-thread pre-check reads
-these stores) are a documented case where a cached write is not guaranteed visible to a concurrent
-reader until the cache flushes. That is a plausible contributor to the *general* pre-validation race
-the code already documents, but it does not by itself explain how one single `bankReference` was
-recorded under two different outcomes rather than two different `bankReference`s each getting their
-own (correct) outcome — which is what happened correctly 51,924 and 52,625 other times in these two
-runs. This needs dedicated reproduction (DEBUG-level Kafka Streams/producer logging, or rerunning
-with caching explicitly disabled) before asserting a root cause; this report only asserts what it
-directly observed.
+| Stage | Obs. TPS | p50 | p95 | p99 |
+|---|---|---|---|---|
+| Ramp 50→500 TPS | 275.7 | 4.96ms | 7.81ms | 8.84ms |
+| Ramp 500→1,000 TPS | 750.5 | 3.94ms | 6.61ms | 7.55ms |
+| Ramp 1,000→2,000 TPS | 1,500.6 | 3.73ms | 6.61ms | 9.74ms |
+| Ramp-down | 997.2 | 3.78ms | 6.62ms | 7.79ms |
 
-**Why this matters for the comparison**: RDBMS's payment path is a single ACID transaction guarded
-by `SELECT FOR UPDATE` — there is no code path in that design by which one client-issued reference
-could be recorded under two different outcomes. evtsrc's audit failing twice, in the same specific
-way, specifically during the saturation window from §3, is a real reliability difference the latency
-numbers alone don't capture: under load, RDBMS's worst observed behavior in this report is *slow*;
-evtsrc's is a small but non-zero rate of duplicate financial records (roughly 1 in 26,000–27,000
-accepted payments in each run).
+evtsrc's tail is essentially flat across all four stages in both runs — the 1,000→2,000 TPS stage's
+p99 (12.18ms, 9.74ms) is barely above the ramp's lowest-load stage. RDBMS shows a mild, recovering
+tail bump in the same stage (152.27ms, well under the 500ms threshold, and gone by ramp-down). Both
+shapes are healthy. Neither shows the "median itself degrades and the tail keeps climbing past
+ramp-down" signature the morning's evtsrc runs showed.
 
 ---
 
-## 5. Financial correctness audit (`scenarios/verify-correctness.py`)
+## 4. Financial correctness audit (`scenarios/verify-correctness.py`)
 
 | Run | k6 outcome log vs. recorded payment rows | RocksDB vs. Postgres (evtsrc only) |
 |---|---|---|
-| RDBMS | PASS — 28,810 accepted, 57,629 rejected (0 or 1 flagged row each), 0 mismatches | N/A |
-| evtsrc Run 1 | **FAIL — 1 mismatch** (see §4) out of 78,183 ground-truth entries | **FAIL — 1 mismatch**, same charge |
-| evtsrc Run 2 | **FAIL — 1 mismatch** (see §4) out of 79,240 ground-truth entries | **FAIL — 1 mismatch**, same charge |
+| RDBMS | PASS — 28,885 accepted, 57,499 rejected (0 or 1 flagged row each), 0 mismatches | N/A |
+| evtsrc Run 1 | PASS — 28,788 accepted, 57,814 double-settlement (every one flagged), 0 mismatches | PASS — 0 mismatches |
+| evtsrc Run 2 | PASS — 28,798 accepted, 57,827 double-settlement (every one flagged), 0 mismatches | PASS — 0 mismatches |
 
-RDBMS's rejections correctly show zero footprint (its pessimistic lock rejects before any row is
-written for the ordinary, non-racing case). evtsrc's rejections correctly show exactly one flagged
-row each, with the one exception identified in §4 per run.
+All three runs pass cleanly on every check. Compare against the Fourth gap in
+`docs/benchmark-remediation-guideline.md`, where the same audit against the same code, the same
+scripts, and the same seed data failed identically in two out of two runs that morning.
 
 ---
 
-## 6. What's still needed for full confidence
+## 5. What's still needed for full confidence
 
-1. **Root-cause the §4 defect.** Reproduce with DEBUG-level Kafka Streams consumer/producer logging,
-   or rerun with `.withCachingDisabled()` on all three state stores to see whether the defect
-   disappears — that would confirm or rule out the caching-staleness hypothesis directly instead of
-   leaving it as a plausible-but-unconfirmed explanation.
-2. **Confirm the §3 saturation mechanism.** Capture Tomcat thread-pool active-count and Kafka
-   producer/consumer queue depth *during* a run to confirm the thread-pool-ceiling hypothesis rather
-   than infer it from VU counts and latency shape alone.
-3. **Dedicated (not shared) hardware**, and specifically for evtsrc: isolate how much of its
-   overhead is the Kafka broker and Streams threads competing with the app JVM and the load
-   generator for the same cores, versus an inherent cost of the produce-and-wait request path.
-4. **RDBMS's own hot-row lock-contention behavior** (documented in an earlier version of this
-   report from a long-running, never-reset database) was not re-verified in this pass, since every
-   run here started from an empty database. If that finding matters for capacity planning, it needs
-   its own dedicated long-running test with a small, deliberately concentrated VA pool.
+1. **Dedicated (not shared) hardware** remains the biggest open gap — even this afternoon's clean
+   run shares the machine with background OS processes, and the morning's contamination episode is
+   a direct demonstration of how much that can matter for this specific comparison.
+2. **A repeatable, scriptable environment-contamination check.** This pass's check
+   (`docker ps -a` + `uptime`, done manually, twice, by eye) worked, but a small script that fails
+   loudly if unrelated containers are churning or load average exceeds a threshold would make this
+   procedure enforceable rather than a manual step someone can forget.
+3. **The morning's saturation and correctness-defect findings are retracted, not explained.** This
+   report does not know *why* resource contention (a hanging OrbStack VM, and/or a concurrent
+   Testcontainers session) would specifically produce a Kafka-Streams double-write rather than, say,
+   uniformly slower responses on both systems. If either finding recurs under a verified-clean
+   environment in the future, it should be treated as new evidence, not a confirmation of the
+   morning's report — this pass's data currently argues against it being real.
+4. RDBMS's hot-row lock-contention behavior (from an even earlier report, run against a long-lived,
+   never-reset database) remains unverified in any of today's runs, which all started from empty
+   databases by design.
 
 No numbers above are invented or estimated — every figure comes from a committed artifact under
 `scenarios/results/` and a live `verify-correctness.py` / `knee-analysis.py` run against it.

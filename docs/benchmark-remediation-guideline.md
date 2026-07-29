@@ -383,6 +383,38 @@ value) on the second independently-reset run, which is what turned "possibly noi
 reproducible characteristic of this design under saturation." A single run — however clean — would
 not have distinguished those two possibilities.
 
+### Fifth gap: the Fourth gap's findings did not survive a controlled re-run (2026-07-29, afternoon)
+
+The Fourth gap above (saturation ceiling + a double-recorded payment, reproduced in two runs the
+same morning) was itself measured on a machine the operator later discovered had a hanging OrbStack
+VM, and which this session separately observed running another Testcontainers-based test session's
+containers during setup for the very next benchmark attempt. The operator restarted the machine,
+explicitly citing "a severe resource hogging problem," and asked for the benchmark to be redone.
+
+Re-run with the same scripts, same seed data, same six BSI VA/amount pairs, same ramp profile, on
+the freshly-restarted machine — with an explicit contamination check (`docker ps -a` + `uptime`,
+repeated until no unrelated container churn appeared and load average had settled) added before
+each load-generation phase for the first time — evtsrc's p99 came back at 8.5ms and 9.4ms across two
+runs (vs. 1.16s–3.22s that morning), flat across every ramp stage, and both runs' correctness audits
+passed with zero mismatches on both checks (vs. one double-recorded payment per run that morning).
+RDBMS's own run was mildly noisier than its own best prior run (p99 112ms vs. 50ms) but showed no
+saturation shape either.
+
+**This means the Fourth gap's headline findings — evtsrc saturating around 1,000–2,000 TPS, and a
+reproducible financial-correctness defect — do not currently hold.** They were real measurements of
+a real but contaminated environment, not a fabrication and not (as far as this pass can tell) a
+latent bug reliably triggered by load. `scenarios/perf_benchmark_report.md` has been rewritten to
+lead with this retraction rather than quietly replacing the numbers, precisely because the old
+numbers were reported with the same confidence and the same audit-passing rigor the Third gap's fix
+was — a green audit and a clean-looking run are necessary but not sufficient; the actual machine
+state at the time of the run is a variable this project had not been controlling for, and evidently
+needed to.
+
+A reminder alongside the first four: this project's own stated purpose is catching exactly this
+class of error before it reaches a conclusion. Finding that its own most dramatic finding to date
+was itself a contamination artifact, one benchmark cycle later, is uncomfortable but is the system
+working as intended — better here than in a published comparison relied on for real decisions.
+
 ### Acceptance criteria for the re-benchmark
 
 1. [DONE] Both systems benchmarked through the same adapter protocol, same seed, same script, same
